@@ -168,6 +168,7 @@ export default function PlaybookBuilderClient(props: {
                             <div
                               ref={draggable.innerRef}
                               {...draggable.draggableProps}
+                              style={draggable.draggableProps.style as React.CSSProperties}
                               className="border rounded-xl p-4 bg-background"
                             >
                               <div className="flex items-center justify-between gap-3">
