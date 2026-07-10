@@ -1,24 +1,35 @@
 'use server'
 
-import { createClient } from '@/lib/supabase/server'
 import { revalidatePath } from 'next/cache'
 import { cookies } from 'next/headers'
+import jwt from 'jsonwebtoken'
+import pool from '@/lib/db'
+
+const JWT_SECRET = process.env.JWT_SECRET as string
 
 // Require super_admin role for all these actions
-async function requireSuperAdmin(supabase: any) {
+async function requireSuperAdmin() {
   const cookieStore = await cookies()
-  const isMockAuth = cookieStore.get('sb-mock-auth')?.value === 'true'
-  const bypassAuth = process.env.NEXT_PUBLIC_BYPASS_AUTH === 'true'
+  const token = cookieStore.get('magnivo_super_token')?.value
+  if (!token) return { ok: false, error: 'Authentication required' }
 
-  if (isMockAuth || bypassAuth) return { ok: true, user: null }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET) as any
+    if (payload.role !== 'super_admin') return { ok: false, error: 'Super admin access required' }
+    return { ok: true, user: payload }
+  } catch {
+    return { ok: false, error: 'Invalid session' }
+  }
+}
 
-  const { data: { user } } = await supabase.auth.getUser()
-  if (!user) return { ok: false, error: 'Authentication required' }
-
-  const { data: profile } = await supabase.from('users').select('role').eq('id', user.id).single()
-  if (profile?.role !== 'super_admin') return { ok: false, error: 'Super admin access required' }
-
-  return { ok: true, user }
+// SELECT queries fall back to [] instead of throwing when a table doesn't exist yet
+async function safeQuery(sql: string, params: any[] = []) {
+  try {
+    return await pool.query(sql, params)
+  } catch (err) {
+    console.error('super-admin query failed:', err)
+    return { rows: [] as any[] }
+  }
 }
 
 // ──────────────────────────────────────────
@@ -26,36 +37,55 @@ async function requireSuperAdmin(supabase: any) {
 // ──────────────────────────────────────────
 
 export async function getAllClients() {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
 
-  const { data: orgs } = await supabase
-    .from('organizations')
-    .select(`
-      id, name, created_at,
-      users(count),
-      client_subscriptions(plan_name, status, mrr_cents, payment_status)
-    `)
-    .order('created_at', { ascending: false })
+  const { rows: orgs } = await safeQuery(
+    `SELECT id, name, created_at FROM public.organizations ORDER BY created_at DESC`
+  )
+  const { rows: userCounts } = await safeQuery(
+    `SELECT organization_id, COUNT(*)::int AS count FROM public.users GROUP BY organization_id`
+  )
+  const { rows: subs } = await safeQuery(
+    `SELECT organization_id, plan_name, status, mrr_cents, payment_status FROM public.client_subscriptions`
+  )
 
-  return orgs || []
+  const userCountMap = new Map(userCounts.map((r: any) => [r.organization_id, r.count]))
+  const subsMap = new Map<string, any[]>()
+  for (const s of subs) {
+    if (!subsMap.has(s.organization_id)) subsMap.set(s.organization_id, [])
+    subsMap.get(s.organization_id)!.push(s)
+  }
+
+  return orgs.map((o: any) => ({
+    ...o,
+    users: [{ count: userCountMap.get(o.id) || 0 }],
+    client_subscriptions: subsMap.get(o.id) || [],
+  }))
 }
 
 export async function getClientDetail(orgId: string) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { org: null, users: [], invoices: [], usageSummary: [] }
 
-  const [{ data: org }, { data: users }, { data: invoices }, { data: usageSummary }] = await Promise.all([
-    supabase.from('organizations').select('*').eq('id', orgId).single(),
-    supabase.from('users').select('id, full_name, role, created_at').eq('organization_id', orgId),
-    supabase.from('invoices').select('*').eq('organization_id', orgId).order('issued_at', { ascending: false }).limit(10),
-    supabase.from('token_usage_logs')
-      .select('model, feature, total_tokens, estimated_cost_usd')
-      .eq('organization_id', orgId)
-      .gte('date', new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)),
+  const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
+
+  const [orgRes, usersRes, invoicesRes, usageRes] = await Promise.all([
+    safeQuery(`SELECT * FROM public.organizations WHERE id = $1`, [orgId]),
+    safeQuery(`SELECT id, full_name, role, created_at FROM public.users WHERE organization_id = $1`, [orgId]),
+    safeQuery(`SELECT * FROM public.invoices WHERE organization_id = $1 ORDER BY issued_at DESC LIMIT 10`, [orgId]),
+    safeQuery(
+      `SELECT model, feature, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE organization_id = $1 AND date >= $2`,
+      [orgId, since]
+    ),
   ])
 
-  return { org, users: users || [], invoices: invoices || [], usageSummary: usageSummary || [] }
+  return {
+    org: orgRes.rows[0] || null,
+    users: usersRes.rows,
+    invoices: invoicesRes.rows,
+    usageSummary: usageRes.rows,
+  }
 }
 
 export async function onboardClient(data: {
@@ -64,64 +94,56 @@ export async function onboardClient(data: {
   domain: string
   plan: string
 }) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  // Create organization
-  const { data: org, error: orgError } = await supabase
-    .from('organizations')
-    .insert({ name: data.companyName, timezone: 'UTC', currency: 'USD' })
-    .select('id')
-    .single()
+  let org
+  try {
+    const orgRes = await pool.query(
+      `INSERT INTO public.organizations (name, timezone, currency) VALUES ($1, 'UTC', 'USD') RETURNING id`,
+      [data.companyName]
+    )
+    org = orgRes.rows[0]
+  } catch (err: any) {
+    return { error: err.message || 'Failed to create organization' }
+  }
 
-  if (orgError || !org) return { error: orgError?.message || 'Failed to create organization' }
+  if (!org) return { error: 'Failed to create organization' }
 
-  // Get plan details
-  const { data: plan } = await supabase
-    .from('subscription_plans')
-    .select('*')
-    .eq('name', data.plan)
-    .single()
+  const { rows: planRows } = await safeQuery(`SELECT * FROM public.subscription_plans WHERE name = $1`, [data.plan])
+  const plan = planRows[0]
 
-  // Create trial subscription
   const trialEnd = new Date()
   trialEnd.setDate(trialEnd.getDate() + 14)
 
-  await supabase.from('client_subscriptions').insert({
-    organization_id: org.id,
-    plan_id: plan?.id,
-    plan_name: data.plan,
-    status: 'trial',
-    mrr_cents: 0,
-    token_limit: plan?.token_limit || 10000000,
-    trial_ends_at: trialEnd.toISOString(),
-    payment_status: 'trial',
-  })
+  await pool.query(
+    `INSERT INTO public.client_subscriptions (organization_id, plan_id, plan_name, status, mrr_cents, token_limit, trial_ends_at, payment_status)
+     VALUES ($1, $2, $3, 'trial', 0, $4, $5, 'trial')`,
+    [org.id, plan?.id || null, data.plan, plan?.token_limit || 10000000, trialEnd.toISOString()]
+  )
 
-  // Create onboarding tracker
-  await supabase.from('client_onboarding').insert({
-    organization_id: org.id,
-    steps: [
-      { key: 'signup', label: 'Account Created', done: true, ts: new Date().toISOString() },
-      { key: 'invite', label: 'Admin Invited', done: false, ts: null },
-      { key: 'profile', label: 'Profile Completed', done: false, ts: null },
-      { key: 'integrations', label: 'Email Connected', done: false, ts: null },
-      { key: 'icp', label: 'ICP Profile Created', done: false, ts: null },
-      { key: 'first_run', label: 'First GTM Run', done: false, ts: null },
-      { key: 'payment', label: 'Payment Method Added', done: false, ts: null },
-      { key: 'converted', label: 'Converted to Paid', done: false, ts: null },
-    ],
-  })
+  await pool.query(
+    `INSERT INTO public.onboarding_tracker (organization_id, steps) VALUES ($1, $2)`,
+    [
+      org.id,
+      JSON.stringify([
+        { key: 'signup', label: 'Account Created', done: true, ts: new Date().toISOString() },
+        { key: 'invite', label: 'Admin Invited', done: false, ts: null },
+        { key: 'profile', label: 'Profile Completed', done: false, ts: null },
+        { key: 'integrations', label: 'Email Connected', done: false, ts: null },
+        { key: 'icp', label: 'ICP Profile Created', done: false, ts: null },
+        { key: 'first_run', label: 'First GTM Run', done: false, ts: null },
+        { key: 'payment', label: 'Payment Method Added', done: false, ts: null },
+        { key: 'converted', label: 'Converted to Paid', done: false, ts: null },
+      ]),
+    ]
+  )
 
-  // Log the action
-  await supabase.from('platform_audit_logs').insert({
-    action: 'client.onboarded',
-    target_type: 'client',
-    target_id: org.id,
-    target_label: data.companyName,
-    details: `Onboarded ${data.companyName} on ${data.plan} plan`,
-    severity: 'low',
-  })
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    ['client.onboarded', 'client', org.id, data.companyName, `Onboarded ${data.companyName} on ${data.plan} plan`, 'low']
+  )
 
   revalidatePath('/super-admin/clients')
   revalidatePath('/super-admin/onboarding')
@@ -129,51 +151,37 @@ export async function onboardClient(data: {
 }
 
 export async function suspendClient(orgId: string, reason: string) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  await supabase
-    .from('client_subscriptions')
-    .update({ status: 'suspended' })
-    .eq('organization_id', orgId)
+  await pool.query(`UPDATE public.client_subscriptions SET status = 'suspended' WHERE organization_id = $1`, [orgId])
 
-  await supabase.from('platform_audit_logs').insert({
-    action: 'client.suspended',
-    target_type: 'client',
-    target_id: orgId,
-    details: reason,
-    severity: 'high',
-  })
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['client.suspended', 'client', orgId, reason, 'high']
+  )
 
   revalidatePath('/super-admin/clients')
   return { success: true }
 }
 
 export async function changeClientPlan(orgId: string, newPlan: string) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  const { data: plan } = await supabase
-    .from('subscription_plans')
-    .select('*')
-    .eq('name', newPlan)
-    .single()
-
+  const { rows: planRows } = await safeQuery(`SELECT * FROM public.subscription_plans WHERE name = $1`, [newPlan])
+  const plan = planRows[0]
   if (!plan) return { error: 'Plan not found' }
 
-  await supabase
-    .from('client_subscriptions')
-    .update({ plan_name: newPlan, plan_id: plan.id, token_limit: plan.token_limit, mrr_cents: plan.price_monthly })
-    .eq('organization_id', orgId)
+  await pool.query(
+    `UPDATE public.client_subscriptions SET plan_name = $1, plan_id = $2, token_limit = $3, mrr_cents = $4 WHERE organization_id = $5`,
+    [newPlan, plan.id, plan.token_limit, plan.price_monthly, orgId]
+  )
 
-  await supabase.from('platform_audit_logs').insert({
-    action: 'client.plan_changed',
-    target_type: 'client',
-    target_id: orgId,
-    target_label: `→ ${newPlan}`,
-    details: `Plan changed to ${newPlan}, $${(plan.price_monthly / 100).toFixed(0)}/mo`,
-    severity: 'medium',
-  })
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
+    ['client.plan_changed', 'client', orgId, `→ ${newPlan}`, `Plan changed to ${newPlan}, $${(plan.price_monthly / 100).toFixed(0)}/mo`, 'medium']
+  )
 
   revalidatePath('/super-admin/clients')
   return { success: true }
@@ -184,21 +192,19 @@ export async function changeClientPlan(orgId: string, newPlan: string) {
 // ──────────────────────────────────────────
 
 export async function getAllInvoices(status?: string) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
 
-  let query = supabase
-    .from('invoices')
-    .select('*, organizations(name)')
-    .order('issued_at', { ascending: false })
-    .limit(100)
-
+  const params: any[] = []
+  let sql = `SELECT i.*, o.name AS organization_name FROM public.invoices i LEFT JOIN public.organizations o ON o.id = i.organization_id`
   if (status && status !== 'all') {
-    query = query.eq('status', status)
+    params.push(status)
+    sql += ` WHERE i.status = $${params.length}`
   }
+  sql += ` ORDER BY i.issued_at DESC LIMIT 100`
 
-  const { data } = await query
-  return data || []
+  const { rows } = await safeQuery(sql, params)
+  return rows.map((r: any) => ({ ...r, organizations: { name: r.organization_name } }))
 }
 
 export async function issueInvoice(data: {
@@ -208,37 +214,28 @@ export async function issueInvoice(data: {
   dueDate: string
   notes?: string
 }) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  // Generate invoice number
-  const { count } = await supabase.from('invoices').select('*', { count: 'exact', head: true })
-  const invoiceNum = `INV-${String((count || 0) + 1000 + 1).padStart(4, '0')}`
+  const { rows: countRows } = await safeQuery(`SELECT COUNT(*)::int AS count FROM public.invoices`)
+  const invoiceNum = `INV-${String((countRows[0]?.count || 0) + 1000 + 1).padStart(4, '0')}`
 
-  const { data: invoice, error } = await supabase
-    .from('invoices')
-    .insert({
-      invoice_number: invoiceNum,
-      organization_id: data.orgId,
-      plan_name: data.planName,
-      amount_cents: data.amountCents,
-      status: 'pending',
-      due_at: data.dueDate,
-      notes: data.notes,
-    })
-    .select()
-    .single()
+  let invoice
+  try {
+    const insertRes = await pool.query(
+      `INSERT INTO public.invoices (invoice_number, organization_id, plan_name, amount_cents, status, due_at, notes)
+       VALUES ($1, $2, $3, $4, 'pending', $5, $6) RETURNING *`,
+      [invoiceNum, data.orgId, data.planName, data.amountCents, data.dueDate, data.notes || null]
+    )
+    invoice = insertRes.rows[0]
+  } catch (err: any) {
+    return { error: err.message }
+  }
 
-  if (error) return { error: error.message }
-
-  await supabase.from('platform_audit_logs').insert({
-    action: 'invoice.issued',
-    target_type: 'billing',
-    target_id: invoice.id,
-    target_label: invoiceNum,
-    details: `Manual invoice issued for $${(data.amountCents / 100).toFixed(2)}`,
-    severity: 'low',
-  })
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
+    ['invoice.issued', 'billing', invoice.id, invoiceNum, `Manual invoice issued for $${(data.amountCents / 100).toFixed(2)}`, 'low']
+  )
 
   revalidatePath('/super-admin/billing')
   return { success: true, invoiceId: invoice.id, invoiceNumber: invoiceNum }
@@ -249,28 +246,24 @@ export async function issueInvoice(data: {
 // ──────────────────────────────────────────
 
 export async function getPlatformTokenUsage(days = 30) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { byModel: [], byClient: [], byFeature: [], daily: [] }
 
   const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
 
-  const [{ data: byModel }, { data: byClient }, { data: byFeature }, { data: daily }] = await Promise.all([
-    supabase.from('token_usage_logs')
-      .select('model, total_tokens, estimated_cost_usd')
-      .gte('date', since),
-    supabase.from('token_usage_logs')
-      .select('organization_id, total_tokens, estimated_cost_usd')
-      .gte('date', since),
-    supabase.from('token_usage_logs')
-      .select('feature, total_tokens, estimated_cost_usd')
-      .gte('date', since),
-    supabase.from('token_usage_logs')
-      .select('date, total_tokens, estimated_cost_usd')
-      .gte('date', since)
-      .order('date', { ascending: true }),
+  const [byModelRes, byClientRes, byFeatureRes, dailyRes] = await Promise.all([
+    safeQuery(`SELECT model, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1`, [since]),
+    safeQuery(`SELECT organization_id, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1`, [since]),
+    safeQuery(`SELECT feature, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1`, [since]),
+    safeQuery(`SELECT date, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1 ORDER BY date ASC`, [since]),
   ])
 
-  return { byModel: byModel || [], byClient: byClient || [], byFeature: byFeature || [], daily: daily || [] }
+  return {
+    byModel: byModelRes.rows,
+    byClient: byClientRes.rows,
+    byFeature: byFeatureRes.rows,
+    daily: dailyRes.rows,
+  }
 }
 
 export async function logTokenUsage(data: {
@@ -281,24 +274,20 @@ export async function logTokenUsage(data: {
   completionTokens: number
   costUsd: number
 }) {
-  const supabase = await createClient()
-
   const totalTokens = data.promptTokens + data.completionTokens
   const today = new Date().toISOString().slice(0, 10)
 
-  await supabase.from('token_usage_logs').upsert({
-    organization_id: data.orgId,
-    date: today,
-    model: data.model,
-    feature: data.feature,
-    prompt_tokens: data.promptTokens,
-    completion_tokens: data.completionTokens,
-    total_tokens: totalTokens,
-    estimated_cost_usd: data.costUsd,
-  }, {
-    onConflict: 'organization_id,date,model,feature',
-    ignoreDuplicates: false,
-  })
+  await pool.query(
+    `INSERT INTO public.token_usage_logs (organization_id, date, model, feature, prompt_tokens, completion_tokens, total_tokens, estimated_cost_usd)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (organization_id, date, model, feature)
+     DO UPDATE SET
+       prompt_tokens = EXCLUDED.prompt_tokens,
+       completion_tokens = EXCLUDED.completion_tokens,
+       total_tokens = EXCLUDED.total_tokens,
+       estimated_cost_usd = EXCLUDED.estimated_cost_usd`,
+    [data.orgId, today, data.model, data.feature, data.promptTokens, data.completionTokens, totalTokens, data.costUsd]
+  )
 }
 
 // ──────────────────────────────────────────
@@ -306,18 +295,28 @@ export async function logTokenUsage(data: {
 // ──────────────────────────────────────────
 
 export async function getSupportTickets(status?: string) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
 
-  let query = supabase
-    .from('support_tickets')
-    .select('*, organizations(name), support_ticket_messages(count)')
-    .order('created_at', { ascending: false })
+  const params: any[] = []
+  let sql = `
+    SELECT t.*, o.name AS organization_name,
+      (SELECT COUNT(*) FROM public.support_messages m WHERE m.ticket_id = t.id)::int AS message_count
+    FROM public.support_tickets t
+    LEFT JOIN public.organizations o ON o.id = t.organization_id
+  `
+  if (status && status !== 'all') {
+    params.push(status)
+    sql += ` WHERE t.status = $${params.length}`
+  }
+  sql += ` ORDER BY t.created_at DESC`
 
-  if (status && status !== 'all') query = query.eq('status', status)
-
-  const { data } = await query
-  return data || []
+  const { rows } = await safeQuery(sql, params)
+  return rows.map((r: any) => ({
+    ...r,
+    organizations: { name: r.organization_name },
+    support_ticket_messages: [{ count: r.message_count }],
+  }))
 }
 
 export async function createSupportTicket(data: {
@@ -327,67 +326,59 @@ export async function createSupportTicket(data: {
   priority: string
   category: string
 }) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  const { count } = await supabase.from('support_tickets').select('*', { count: 'exact', head: true })
-  const ticketNum = `TKT-${String((count || 0) + 100 + 1).padStart(3, '0')}`
+  const { rows: countRows } = await safeQuery(`SELECT COUNT(*)::int AS count FROM public.support_tickets`)
+  const ticketNum = `TKT-${String((countRows[0]?.count || 0) + 100 + 1).padStart(3, '0')}`
 
-  const { data: ticket, error } = await supabase
-    .from('support_tickets')
-    .insert({
-      ticket_number: ticketNum,
-      organization_id: data.orgId,
-      subject: data.subject,
-      description: data.description,
-      priority: data.priority,
-      category: data.category,
-      status: 'open',
-    })
-    .select()
-    .single()
-
-  if (error) return { error: error.message }
+  let ticket
+  try {
+    const insertRes = await pool.query(
+      `INSERT INTO public.support_tickets (ticket_number, organization_id, subject, description, priority, category, status)
+       VALUES ($1, $2, $3, $4, $5, $6, 'open') RETURNING *`,
+      [ticketNum, data.orgId, data.subject, data.description, data.priority, data.category]
+    )
+    ticket = insertRes.rows[0]
+  } catch (err: any) {
+    return { error: err.message }
+  }
 
   revalidatePath('/super-admin/support')
   return { success: true, ticketId: ticket.id }
 }
 
 export async function resolveTicket(ticketId: string) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  await supabase
-    .from('support_tickets')
-    .update({ status: 'resolved', resolved_at: new Date().toISOString() })
-    .eq('id', ticketId)
+  await pool.query(
+    `UPDATE public.support_tickets SET status = 'resolved', resolved_at = $1 WHERE id = $2`,
+    [new Date().toISOString(), ticketId]
+  )
 
-  await supabase.from('platform_audit_logs').insert({
-    action: 'ticket.resolved',
-    target_type: 'support',
-    target_id: ticketId,
-    severity: 'low',
-  })
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, severity) VALUES ($1, $2, $3, $4)`,
+    ['ticket.resolved', 'support', ticketId, 'low']
+  )
 
   revalidatePath('/super-admin/support')
   return { success: true }
 }
 
 export async function replyToTicket(ticketId: string, content: string, senderName: string) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  await supabase.from('support_ticket_messages').insert({
-    ticket_id: ticketId,
-    sender_type: 'staff',
-    sender_name: senderName,
-    content,
-  })
+  await pool.query(
+    `INSERT INTO public.support_messages (ticket_id, sender_type, sender_name, content) VALUES ($1, 'staff', $2, $3)`,
+    [ticketId, senderName, content]
+  )
 
-  await supabase
-    .from('support_tickets')
-    .update({ status: 'in_progress', updated_at: new Date().toISOString() })
-    .eq('id', ticketId)
+  await pool.query(
+    `UPDATE public.support_tickets SET status = 'in_progress', updated_at = $1 WHERE id = $2`,
+    [new Date().toISOString(), ticketId]
+  )
 
   revalidatePath('/super-admin/support')
   return { success: true }
@@ -402,20 +393,28 @@ export async function getPlatformAuditLogs(filters: {
   targetType?: string
   limit?: number
 } = {}) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
 
-  let query = supabase
-    .from('platform_audit_logs')
-    .select('*')
-    .order('created_at', { ascending: false })
-    .limit(filters.limit || 200)
+  const params: any[] = []
+  const conditions: string[] = []
 
-  if (filters.severity && filters.severity !== 'all') query = query.eq('severity', filters.severity)
-  if (filters.targetType && filters.targetType !== 'all') query = query.eq('target_type', filters.targetType)
+  if (filters.severity && filters.severity !== 'all') {
+    params.push(filters.severity)
+    conditions.push(`severity = $${params.length}`)
+  }
+  if (filters.targetType && filters.targetType !== 'all') {
+    params.push(filters.targetType)
+    conditions.push(`target_type = $${params.length}`)
+  }
 
-  const { data } = await query
-  return data || []
+  let sql = `SELECT * FROM public.super_admin_audit_logs`
+  if (conditions.length) sql += ` WHERE ${conditions.join(' AND ')}`
+  params.push(filters.limit || 200)
+  sql += ` ORDER BY created_at DESC LIMIT $${params.length}`
+
+  const { rows } = await safeQuery(sql, params)
+  return rows
 }
 
 // ──────────────────────────────────────────
@@ -423,15 +422,11 @@ export async function getPlatformAuditLogs(filters: {
 // ──────────────────────────────────────────
 
 export async function getTeamMembers() {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
 
-  const { data } = await supabase
-    .from('super_admin_users')
-    .select('*')
-    .order('created_at', { ascending: true })
-
-  return data || []
+  const { rows } = await safeQuery(`SELECT * FROM public.internal_team ORDER BY created_at ASC`)
+  return rows
 }
 
 export async function inviteTeamMember(data: {
@@ -440,31 +435,25 @@ export async function inviteTeamMember(data: {
   role: string
   department: string
 }) {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
 
-  const { data: member, error } = await supabase
-    .from('super_admin_users')
-    .insert({
-      email: data.email,
-      full_name: data.fullName,
-      role: data.role,
-      department: data.department,
-      is_active: false, // becomes true once they accept invite
-    })
-    .select()
-    .single()
+  let member
+  try {
+    const insertRes = await pool.query(
+      `INSERT INTO public.internal_team (email, full_name, role, department, is_active)
+       VALUES ($1, $2, $3, $4, false) RETURNING *`,
+      [data.email, data.fullName, data.role, data.department]
+    )
+    member = insertRes.rows[0]
+  } catch (err: any) {
+    return { error: err.message }
+  }
 
-  if (error) return { error: error.message }
-
-  await supabase.from('platform_audit_logs').insert({
-    action: 'team.member_invited',
-    target_type: 'team',
-    target_id: member.id,
-    target_label: `${data.fullName} (${data.role})`,
-    details: `Invited ${data.email} as ${data.role}`,
-    severity: 'low',
-  })
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
+    ['team.member_invited', 'team', member.id, `${data.fullName} (${data.role})`, `Invited ${data.email} as ${data.role}`, 'low']
+  )
 
   revalidatePath('/super-admin/team')
   return { success: true }
@@ -475,24 +464,25 @@ export async function inviteTeamMember(data: {
 // ──────────────────────────────────────────
 
 export async function getPlatformStats() {
-  const supabase = await createClient()
-  await requireSuperAdmin(supabase)
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { totalClients: 0, totalUsers: 0, activeClients: 0, totalMRR: 0, openTickets: 0 }
 
-  const [{ count: totalClients }, { count: totalUsers }, { data: subscriptions }, { data: openTickets }] = await Promise.all([
-    supabase.from('organizations').select('*', { count: 'exact', head: true }),
-    supabase.from('users').select('*', { count: 'exact', head: true }),
-    supabase.from('client_subscriptions').select('status, mrr_cents'),
-    supabase.from('support_tickets').select('id').eq('status', 'open'),
+  const [clientsRes, usersRes, subsRes, ticketsRes] = await Promise.all([
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.organizations`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.users`),
+    safeQuery(`SELECT status, mrr_cents FROM public.client_subscriptions`),
+    safeQuery(`SELECT id FROM public.support_tickets WHERE status = 'open'`),
   ])
 
-  const activeClients = subscriptions?.filter(s => s.status === 'active').length || 0
-  const totalMRR = subscriptions?.reduce((acc, s) => acc + (s.mrr_cents || 0), 0) || 0
+  const subscriptions = subsRes.rows
+  const activeClients = subscriptions.filter((s: any) => s.status === 'active').length
+  const totalMRR = subscriptions.reduce((acc: number, s: any) => acc + (s.mrr_cents || 0), 0)
 
   return {
-    totalClients: totalClients || 0,
-    totalUsers: totalUsers || 0,
+    totalClients: clientsRes.rows[0]?.count || 0,
+    totalUsers: usersRes.rows[0]?.count || 0,
     activeClients,
     totalMRR: totalMRR / 100,
-    openTickets: openTickets?.length || 0,
+    openTickets: ticketsRes.rows.length,
   }
 }

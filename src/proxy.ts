@@ -8,7 +8,7 @@ const PUBLIC_ROUTES = [
   '/api/engage/gmail/webhook',
   '/api/track/',
   '/api/engage/worker',
-  '/super-admin',  // Super admin has its own auth boundary
+  '/api/super-admin/auth/',
   '/landing',
 ]
 
@@ -25,6 +25,21 @@ export default function middleware(req: NextRequest) {
     pathname.startsWith('/favicon') ||
     /\.(?:html?|css|js(?!on)|jpe?g|webp|png|gif|svg|ttf|woff2?|ico|csv|docx?|xlsx?|zip|webmanifest)$/.test(pathname)
   ) {
+    return NextResponse.next()
+  }
+
+  // Super admin routes have their own auth boundary — a valid JWT cookie,
+  // independent of the app's sb-mock-auth / bypass flow.
+  if (pathname.startsWith('/super-admin') || pathname.startsWith('/api/super-admin')) {
+    if (isPublicRoute(pathname)) return NextResponse.next()
+
+    const hasSuperAdminToken = !!req.cookies.get('magnivo_super_token')?.value
+    if (!hasSuperAdminToken) {
+      const login = new URL('/login', req.url)
+      login.searchParams.set('redirect', pathname)
+      return NextResponse.redirect(login)
+    }
+
     return NextResponse.next()
   }
 
