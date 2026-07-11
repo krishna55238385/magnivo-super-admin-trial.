@@ -781,7 +781,13 @@ export async function inviteTeamMember(data: {
 // PLATFORM ANALYTICS
 // ──────────────────────────────────────────
 
-export async function getPlatformStats() {
+const STATS_RANGE_DAYS: Record<'30d' | '90d' | 'year', number> = {
+  '30d': 30,
+  '90d': 90,
+  year: 365,
+}
+
+export async function getPlatformStats(range: '30d' | '90d' | 'year' = '30d') {
   const auth = await requireSuperAdmin()
   if (!auth.ok) {
     return {
@@ -793,8 +799,14 @@ export async function getPlatformStats() {
       open_support_tickets: 0,
       trial_clients: 0,
       active_clients: 0,
+      avg_revenue_per_client: 0,
+      churn_rate: 0,
+      total_token_cost: 0,
     }
   }
+
+  const rangeDays = STATS_RANGE_DAYS[range] ?? 30
+  const rangeStart = new Date(Date.now() - rangeDays * 86400000).toISOString().slice(0, 10)
 
   const [
     clientsRes,
@@ -804,6 +816,8 @@ export async function getPlatformStats() {
     ticketsRes,
     trialRes,
     activeRes,
+    suspendedRes,
+    rangeCostRes,
   ] = await Promise.all([
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.organizations`),
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.users`),
@@ -817,16 +831,100 @@ export async function getPlatformStats() {
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.support_tickets WHERE status = 'open'`),
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.client_subscriptions WHERE status = 'trial'`),
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.client_subscriptions WHERE status = 'active'`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.client_subscriptions WHERE status = 'suspended'`),
+    safeQuery(
+      `SELECT COALESCE(SUM(estimated_cost_usd), 0)::numeric AS cost FROM public.token_usage_logs WHERE date >= $1`,
+      [rangeStart]
+    ),
   ])
 
+  const totalClients = clientsRes.rows[0]?.count || 0
+  const activeCount = activeRes.rows[0]?.count || 0
+  const suspendedCount = suspendedRes.rows[0]?.count || 0
+  const totalMrrCents = Number(mrrRes.rows[0]?.total) || 0
+
   return {
-    total_clients: clientsRes.rows[0]?.count || 0,
+    total_clients: totalClients,
     total_users: usersRes.rows[0]?.count || 0,
-    total_mrr_cents: Number(mrrRes.rows[0]?.total) || 0,
+    total_mrr_cents: totalMrrCents,
     total_token_usage: Number(usageRes.rows[0]?.tokens) || 0,
     total_estimated_cost: Number(usageRes.rows[0]?.cost) || 0,
     open_support_tickets: ticketsRes.rows[0]?.count || 0,
     trial_clients: trialRes.rows[0]?.count || 0,
-    active_clients: activeRes.rows[0]?.count || 0,
+    active_clients: activeCount,
+    avg_revenue_per_client: activeCount > 0 ? totalMrrCents / activeCount : 0,
+    churn_rate: totalClients > 0 ? (suspendedCount / totalClients) * 100 : 0,
+    total_token_cost: Number(rangeCostRes.rows[0]?.cost) || 0,
   }
+}
+
+export async function getMRRTrend(months: number = 6) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(
+    `SELECT DATE_TRUNC('month', created_at) AS month, COALESCE(SUM(mrr_cents), 0)::bigint AS mrr
+     FROM public.client_subscriptions
+     WHERE status = 'active'
+     GROUP BY month
+     ORDER BY month ASC
+     LIMIT $1`,
+    [months]
+  )
+
+  return rows.map((r: any) => ({
+    month: r.month,
+    mrr_cents: Number(r.mrr) || 0,
+  }))
+}
+
+export async function getTopClientsByRevenue(limit: number = 5) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(
+    `SELECT o.name, cs.plan_name, cs.mrr_cents, cs.status, COUNT(u.id)::int AS user_count
+     FROM public.organizations o
+     LEFT JOIN public.client_subscriptions cs ON cs.organization_id = o.id
+     LEFT JOIN public.users u ON u.organization_id = o.id
+     GROUP BY o.id, o.name, cs.plan_name, cs.mrr_cents, cs.status
+     ORDER BY cs.mrr_cents DESC NULLS LAST
+     LIMIT $1`,
+    [limit]
+  )
+
+  return rows.map((r: any) => ({
+    name: r.name,
+    plan_name: r.plan_name,
+    mrr_cents: Number(r.mrr_cents) || 0,
+    status: r.status,
+    user_count: r.user_count,
+  }))
+}
+
+export async function getRecentActivity(limit: number = 10) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(
+    `SELECT * FROM public.super_admin_audit_logs ORDER BY created_at DESC LIMIT $1`,
+    [limit]
+  )
+
+  return rows
+}
+
+export async function getPlanBreakdown() {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(
+    `SELECT cs.plan_name, COUNT(*)::int AS client_count
+     FROM public.client_subscriptions cs
+     WHERE cs.status IN ('active', 'trial')
+     GROUP BY cs.plan_name
+     ORDER BY client_count DESC`
+  )
+
+  return rows
 }
