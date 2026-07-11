@@ -125,6 +125,62 @@ export async function getClientDetail(orgId: string) {
   }
 }
 
+export async function getSupportTicketsForClient(orgId: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(
+    `SELECT st.*, COUNT(sm.id) AS message_count
+     FROM public.support_tickets st
+     LEFT JOIN public.support_messages sm ON sm.ticket_id = st.id
+     WHERE st.organization_id = $1
+     GROUP BY st.id
+     ORDER BY st.created_at DESC`,
+    [orgId]
+  )
+
+  return rows
+}
+
+export async function getAuditLogsForClient(orgId: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(
+    `SELECT * FROM public.super_admin_audit_logs
+     WHERE target_id = $1
+     ORDER BY created_at DESC
+     LIMIT 50`,
+    [orgId]
+  )
+
+  return rows
+}
+
+export async function getNotesForClient(orgId: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { notes: null }
+
+  const { rows } = await safeQuery(
+    `SELECT notes FROM public.onboarding_tracker WHERE organization_id = $1`,
+    [orgId]
+  )
+
+  return { notes: rows[0]?.notes ?? null }
+}
+
+export async function updateClientNotes(orgId: string, notes: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
+
+  await pool.query(
+    `UPDATE public.onboarding_tracker SET notes = $2 WHERE organization_id = $1`,
+    [orgId, notes]
+  )
+
+  return { success: true }
+}
+
 export async function onboardClient(data: {
   companyName: string
   adminEmail: string
@@ -147,7 +203,7 @@ export async function onboardClient(data: {
 
   if (!org) return { error: 'Failed to create organization' }
 
-  const { rows: planRows } = await safeQuery(`SELECT * FROM public.subscription_plans WHERE name = $1`, [data.plan])
+  const { rows: planRows } = await safeQuery(`SELECT * FROM public.plans WHERE name = $1`, [data.plan])
   const plan = planRows[0]
 
   const trialEnd = new Date()
@@ -206,20 +262,116 @@ export async function changeClientPlan(orgId: string, newPlan: string) {
   const auth = await requireSuperAdmin()
   if (!auth.ok) return { error: auth.error }
 
-  const { rows: planRows } = await safeQuery(`SELECT * FROM public.subscription_plans WHERE name = $1`, [newPlan])
+  const { rows: planRows } = await safeQuery(`SELECT * FROM public.plans WHERE name = $1`, [newPlan])
   const plan = planRows[0]
   if (!plan) return { error: 'Plan not found' }
 
   await pool.query(
     `UPDATE public.client_subscriptions SET plan_name = $1, plan_id = $2, token_limit = $3, mrr_cents = $4 WHERE organization_id = $5`,
-    [newPlan, plan.id, plan.token_limit, plan.price_monthly, orgId]
+    [newPlan, plan.id, plan.token_limit, plan.monthly_price_cents, orgId]
   )
 
   await pool.query(
     `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['client.plan_changed', 'client', orgId, `→ ${newPlan}`, `Plan changed to ${newPlan}, $${(plan.price_monthly / 100).toFixed(0)}/mo`, 'medium']
+    ['client.plan_changed', 'client', orgId, `→ ${newPlan}`, `Plan changed to ${newPlan}, $${(plan.monthly_price_cents / 100).toFixed(0)}/mo`, 'medium']
   )
 
+  revalidatePath('/super-admin/clients')
+  return { success: true }
+}
+
+// ──────────────────────────────────────────
+// ONBOARDING TRACKER
+// ──────────────────────────────────────────
+
+const VALID_DOC_FIELDS = new Set([
+  'nda_status',
+  'msa_status',
+  'onboarding_form_status',
+  'data_auth_status',
+  'invoice_status',
+])
+
+const VALID_DOC_STATUSES = new Set([
+  'not_sent',
+  'sent',
+  'signed',
+  'completed',
+  'not_issued',
+  'issued',
+  'paid',
+])
+
+export async function getOnboardingStatus(orgId: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return null
+
+  const { rows } = await safeQuery(
+    `SELECT nda_status, msa_status, onboarding_form_status, data_auth_status, invoice_status, activated_at, notes
+     FROM public.onboarding_tracker WHERE organization_id = $1`,
+    [orgId]
+  )
+
+  return rows[0] || null
+}
+
+export async function updateDocumentStatus(orgId: string, field: string, status: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
+
+  if (!VALID_DOC_FIELDS.has(field)) {
+    throw new Error(`Invalid field: ${field}`)
+  }
+  if (!VALID_DOC_STATUSES.has(status)) {
+    throw new Error(`Invalid status: ${status}`)
+  }
+
+  await pool.query(
+    `UPDATE public.onboarding_tracker SET ${field} = $1 WHERE organization_id = $2`,
+    [status, orgId]
+  )
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
+    ['onboarding.document_updated', 'client', orgId, field, `${field} set to ${status}`, 'low']
+  )
+
+  revalidatePath('/super-admin/onboarding')
+  revalidatePath('/super-admin/clients')
+  return { success: true }
+}
+
+export async function activateClient(orgId: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
+
+  const { rows } = await safeQuery(
+    `SELECT nda_status, msa_status, onboarding_form_status, data_auth_status, invoice_status
+     FROM public.onboarding_tracker WHERE organization_id = $1`,
+    [orgId]
+  )
+  const tracker = rows[0]
+  const allComplete = !!tracker && [
+    tracker.nda_status,
+    tracker.msa_status,
+    tracker.onboarding_form_status,
+    tracker.data_auth_status,
+    tracker.invoice_status,
+  ].every(isStepDone)
+
+  if (!allComplete) {
+    return { error: 'All onboarding documents must be complete before activating' }
+  }
+
+  await pool.query(`UPDATE public.onboarding_tracker SET activated_at = now() WHERE organization_id = $1`, [orgId])
+  await pool.query(`UPDATE public.client_subscriptions SET status = 'active' WHERE organization_id = $1`, [orgId])
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['client.activated', 'client', orgId, 'Client activated after all onboarding documents completed', 'medium']
+  )
+
+  revalidatePath('/super-admin/onboarding')
   revalidatePath('/super-admin/clients')
   return { success: true }
 }
@@ -276,6 +428,116 @@ export async function issueInvoice(data: {
 
   revalidatePath('/super-admin/billing')
   return { success: true, invoiceId: invoice.id, invoiceNumber: invoiceNum }
+}
+
+export async function getMRRBreakdown() {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(
+    `SELECT
+       o.name AS org_name,
+       cs.plan_name,
+       cs.mrr_cents,
+       cs.status,
+       cs.payment_status,
+       cs.trial_ends_at AS renewal_date
+     FROM public.client_subscriptions cs
+     JOIN public.organizations o ON o.id = cs.organization_id
+     WHERE cs.status IN ('active', 'trial')
+     ORDER BY cs.mrr_cents DESC`
+  )
+
+  return rows
+}
+
+export async function getPlans() {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const { rows } = await safeQuery(`SELECT * FROM public.plans ORDER BY monthly_price_cents ASC`)
+  return rows
+}
+
+export async function createPlan(data: {
+  name: string
+  monthly_price_cents: number
+  token_limit: number
+  features: string[]
+}) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
+
+  let plan
+  try {
+    const insertRes = await pool.query(
+      `INSERT INTO public.plans (name, monthly_price_cents, token_limit, features)
+       VALUES ($1, $2, $3, $4) RETURNING id`,
+      [data.name, data.monthly_price_cents, data.token_limit, JSON.stringify(data.features)]
+    )
+    plan = insertRes.rows[0]
+  } catch (err: any) {
+    return { error: err.message }
+  }
+
+  revalidatePath('/super-admin/billing')
+  return { success: true, id: plan.id }
+}
+
+export async function updateInvoiceStatus(invoiceId: string, status: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
+
+  const VALID_INVOICE_STATUSES = new Set(['pending', 'paid', 'overdue', 'cancelled'])
+  if (!VALID_INVOICE_STATUSES.has(status)) {
+    throw new Error(`Invalid status: ${status}`)
+  }
+
+  await pool.query(
+    `UPDATE public.invoices SET status = $1, paid_at = CASE WHEN $1 = 'paid' THEN now() ELSE NULL END WHERE id = $2`,
+    [status, invoiceId]
+  )
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
+    ['invoice.status_updated', 'billing', invoiceId, status, `Invoice status set to ${status}`, 'low']
+  )
+
+  revalidatePath('/super-admin/billing')
+  return { success: true }
+}
+
+export async function getRevenueStats() {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) {
+    return {
+      total_mrr_cents: 0,
+      total_arr_cents: 0,
+      trial_count: 0,
+      active_count: 0,
+      overdue_invoices: 0,
+      total_outstanding_cents: 0,
+    }
+  }
+
+  const [mrrRes, trialRes, activeRes, overdueRes, outstandingRes] = await Promise.all([
+    safeQuery(`SELECT COALESCE(SUM(mrr_cents), 0)::bigint AS total FROM public.client_subscriptions WHERE status = 'active'`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.client_subscriptions WHERE status = 'trial'`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.client_subscriptions WHERE status = 'active'`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.invoices WHERE status = 'overdue'`),
+    safeQuery(`SELECT COALESCE(SUM(amount_cents), 0)::bigint AS total FROM public.invoices WHERE status IN ('pending', 'overdue')`),
+  ])
+
+  const totalMrrCents = Number(mrrRes.rows[0]?.total) || 0
+
+  return {
+    total_mrr_cents: totalMrrCents,
+    total_arr_cents: totalMrrCents * 12,
+    trial_count: trialRes.rows[0]?.count || 0,
+    active_count: activeRes.rows[0]?.count || 0,
+    overdue_invoices: overdueRes.rows[0]?.count || 0,
+    total_outstanding_cents: Number(outstandingRes.rows[0]?.total) || 0,
+  }
 }
 
 // ──────────────────────────────────────────
