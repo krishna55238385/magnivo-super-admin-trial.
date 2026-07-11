@@ -465,24 +465,50 @@ export async function inviteTeamMember(data: {
 
 export async function getPlatformStats() {
   const auth = await requireSuperAdmin()
-  if (!auth.ok) return { totalClients: 0, totalUsers: 0, activeClients: 0, totalMRR: 0, openTickets: 0 }
+  if (!auth.ok) {
+    return {
+      total_clients: 0,
+      total_users: 0,
+      total_mrr_cents: 0,
+      total_token_usage: 0,
+      total_estimated_cost: 0,
+      open_support_tickets: 0,
+      trial_clients: 0,
+      active_clients: 0,
+    }
+  }
 
-  const [clientsRes, usersRes, subsRes, ticketsRes] = await Promise.all([
+  const [
+    clientsRes,
+    usersRes,
+    mrrRes,
+    usageRes,
+    ticketsRes,
+    trialRes,
+    activeRes,
+  ] = await Promise.all([
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.organizations`),
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.users`),
-    safeQuery(`SELECT status, mrr_cents FROM public.client_subscriptions`),
-    safeQuery(`SELECT id FROM public.support_tickets WHERE status = 'open'`),
+    safeQuery(
+      `SELECT COALESCE(SUM(mrr_cents), 0)::bigint AS total FROM public.client_subscriptions WHERE status = 'active'`
+    ),
+    safeQuery(
+      `SELECT COALESCE(SUM(total_tokens), 0)::bigint AS tokens, COALESCE(SUM(estimated_cost_usd), 0)::numeric AS cost
+       FROM public.token_usage_logs WHERE date >= CURRENT_DATE - 30`
+    ),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.support_tickets WHERE status = 'open'`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.client_subscriptions WHERE status = 'trial'`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.client_subscriptions WHERE status = 'active'`),
   ])
 
-  const subscriptions = subsRes.rows
-  const activeClients = subscriptions.filter((s: any) => s.status === 'active').length
-  const totalMRR = subscriptions.reduce((acc: number, s: any) => acc + (s.mrr_cents || 0), 0)
-
   return {
-    totalClients: clientsRes.rows[0]?.count || 0,
-    totalUsers: usersRes.rows[0]?.count || 0,
-    activeClients,
-    totalMRR: totalMRR / 100,
-    openTickets: ticketsRes.rows.length,
+    total_clients: clientsRes.rows[0]?.count || 0,
+    total_users: usersRes.rows[0]?.count || 0,
+    total_mrr_cents: Number(mrrRes.rows[0]?.total) || 0,
+    total_token_usage: Number(usageRes.rows[0]?.tokens) || 0,
+    total_estimated_cost: Number(usageRes.rows[0]?.cost) || 0,
+    open_support_tickets: ticketsRes.rows[0]?.count || 0,
+    trial_clients: trialRes.rows[0]?.count || 0,
+    active_clients: activeRes.rows[0]?.count || 0,
   }
 }
