@@ -36,31 +36,68 @@ async function safeQuery(sql: string, params: any[] = []) {
 // CLIENT MANAGEMENT
 // ──────────────────────────────────────────
 
+// A status counts as "done" once it's moved off its not-started placeholder value
+const NOT_STARTED_STATUSES = new Set(['not_sent', 'not_issued'])
+const isStepDone = (status: string | null) => status != null && !NOT_STARTED_STATUSES.has(status)
+
 export async function getAllClients() {
   const auth = await requireSuperAdmin()
   if (!auth.ok) return []
 
-  const { rows: orgs } = await safeQuery(
-    `SELECT id, name, created_at FROM public.organizations ORDER BY created_at DESC`
-  )
-  const { rows: userCounts } = await safeQuery(
-    `SELECT organization_id, COUNT(*)::int AS count FROM public.users GROUP BY organization_id`
-  )
-  const { rows: subs } = await safeQuery(
-    `SELECT organization_id, plan_name, status, mrr_cents, payment_status FROM public.client_subscriptions`
+  const { rows } = await safeQuery(
+    `SELECT
+       o.id,
+       o.name,
+       o.created_at,
+       COALESCE(uc.user_count, 0)::int AS user_count,
+       COALESCE(cs.plan_name, 'trial') AS plan_name,
+       COALESCE(cs.status, 'trial') AS status,
+       COALESCE(cs.mrr_cents, 0) AS mrr_cents,
+       cs.payment_status,
+       ot.nda_status,
+       ot.msa_status,
+       ot.onboarding_form_status,
+       ot.data_auth_status,
+       ot.invoice_status
+     FROM public.organizations o
+     LEFT JOIN (
+       SELECT organization_id, COUNT(*)::int AS user_count
+       FROM public.users
+       GROUP BY organization_id
+     ) uc ON uc.organization_id = o.id
+     LEFT JOIN LATERAL (
+       SELECT plan_name, status, mrr_cents, payment_status
+       FROM public.client_subscriptions cs
+       WHERE cs.organization_id = o.id
+       ORDER BY cs.created_at DESC
+       LIMIT 1
+     ) cs ON true
+     LEFT JOIN LATERAL (
+       SELECT nda_status, msa_status, onboarding_form_status, data_auth_status, invoice_status
+       FROM public.onboarding_tracker ot
+       WHERE ot.organization_id = o.id
+       ORDER BY ot.created_at DESC
+       LIMIT 1
+     ) ot ON true
+     ORDER BY o.created_at DESC`
   )
 
-  const userCountMap = new Map(userCounts.map((r: any) => [r.organization_id, r.count]))
-  const subsMap = new Map<string, any[]>()
-  for (const s of subs) {
-    if (!subsMap.has(s.organization_id)) subsMap.set(s.organization_id, [])
-    subsMap.get(s.organization_id)!.push(s)
-  }
-
-  return orgs.map((o: any) => ({
-    ...o,
-    users: [{ count: userCountMap.get(o.id) || 0 }],
-    client_subscriptions: subsMap.get(o.id) || [],
+  return rows.map((r: any) => ({
+    id: r.id,
+    name: r.name,
+    created_at: r.created_at,
+    user_count: r.user_count,
+    plan_name: r.plan_name,
+    status: r.status,
+    mrr_cents: r.mrr_cents,
+    payment_status: r.payment_status,
+    onboarding_complete: [
+      r.nda_status,
+      r.msa_status,
+      r.onboarding_form_status,
+      r.data_auth_status,
+      r.invoice_status,
+    ].every(isStepDone),
   }))
 }
 
