@@ -167,7 +167,8 @@ export async function getAuditLogsForClient(orgId: string) {
 
   const { rows } = await safeQuery(
     `SELECT * FROM public.super_admin_audit_logs
-     WHERE target_id = $1
+     WHERE entity_name = (SELECT name FROM public.organizations WHERE id = $1 LIMIT 1)
+     OR details::text LIKE '%' || $1 || '%'
      ORDER BY created_at DESC
      LIMIT 50`,
     [orgId]

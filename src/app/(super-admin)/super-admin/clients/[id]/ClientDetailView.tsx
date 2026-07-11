@@ -1,0 +1,558 @@
+'use client'
+
+import { useState } from 'react'
+import {
+  ArrowLeft, Users, CreditCard, Zap, Settings,
+  AlertCircle, ExternalLink, Shield,
+  Globe, Calendar, DollarSign,
+  FileText, Ban, Edit2, Plus,
+  LifeBuoy, BarChart2, MessageSquare, Send, Clock, Lock, X, Activity
+} from 'lucide-react'
+import Link from 'next/link'
+
+type Org = { id: string; name: string; created_at: string; timezone?: string | null; currency?: string | null; logo_url?: string | null }
+type User = { id: string; full_name: string | null; role: string | null; email?: string | null; is_active?: boolean | null; created_at?: string }
+type Invoice = { id: string; invoice_number: string; amount_cents: number; status: string; issued_at: string }
+type UsageRow = { model: string; feature: string; total_tokens: number; estimated_cost_usd: number }
+type Ticket = { id: string; ticket_number?: string; subject?: string; description?: string; priority?: string; status?: string; category?: string; message_count?: number; created_at?: string }
+type AuditLog = Record<string, any>
+
+const tabs = ['Overview', 'Users', 'Billing', 'Usage', 'Integrations', 'Support', 'Notes', 'Settings', 'Audit']
+
+function formatDate(iso?: string | null) {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function formatDateTime(iso?: string | null) {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleString('en-US', { month: 'short', day: 'numeric', year: 'numeric', hour: 'numeric', minute: '2-digit' })
+}
+
+const invoiceStatusColor: Record<string, string> = {
+  paid: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+  pending: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+  overdue: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  failed: 'bg-red-500/10 text-red-400 border-red-500/20',
+  void: 'bg-white/[0.06] text-white/40 border-white/[0.1]',
+}
+
+const ticketStatusColor: Record<string, string> = {
+  open: 'bg-red-500/10 text-red-400 border-red-500/20',
+  in_progress: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+  waiting: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
+  resolved: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+  closed: 'bg-white/[0.06] text-white/40 border-white/[0.1]',
+}
+
+const OPEN_TICKET_STATUSES = new Set(['open', 'in_progress', 'waiting'])
+
+export default function ClientDetailView({
+  org, users, invoices, usageSummary, tickets, auditLogs, notes: initialNotes,
+}: {
+  org: Org
+  users: User[]
+  invoices: Invoice[]
+  usageSummary: UsageRow[]
+  tickets: Ticket[]
+  auditLogs: AuditLog[]
+  notes: string | null
+}) {
+  const [tab, setTab] = useState('Overview')
+  const [notes, setNotes] = useState(initialNotes ?? '')
+  const [showImpersonateModal, setShowImpersonateModal] = useState(false)
+  const [showDangerConfirm, setShowDangerConfirm] = useState<string | null>(null)
+  const [dangerInput, setDangerInput] = useState('')
+
+  const dangerActions: Record<string, { label: string; confirmWord: string; color: string }> = {
+    suspend: { label: 'Suspend Organization', confirmWord: 'SUSPEND', color: 'amber' },
+    delete: { label: 'Delete Organization', confirmWord: 'DELETE', color: 'red' },
+  }
+
+  const totalTokens30d = usageSummary.reduce((sum, r) => sum + (Number(r.total_tokens) || 0), 0)
+  const openTicketCount = tickets.filter(t => OPEN_TICKET_STATUSES.has(t.status ?? '')).length
+  const totalInvoicedCents = invoices.reduce((sum, i) => sum + (Number(i.amount_cents) || 0), 0)
+
+  return (
+    <div className="space-y-5 max-w-[1300px]">
+      {/* Breadcrumb & header */}
+      <div className="flex items-start justify-between">
+        <div>
+          <Link href="/super-admin/clients" className="inline-flex items-center gap-1.5 text-[12px] text-white/40 hover:text-white/70 mb-3 transition-colors">
+            <ArrowLeft className="w-3.5 h-3.5" /> Back to Clients
+          </Link>
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-white/[0.06] border border-white/[0.1] flex items-center justify-center text-[15px] font-bold text-white/70">
+              {org.name.charAt(0)}
+            </div>
+            <div>
+              <h1 className="text-xl font-semibold text-white">{org.name}</h1>
+              <p className="text-[12px] text-white/40 mt-0.5">Joined {formatDate(org.created_at)}{org.timezone ? ` · ${org.timezone}` : ''}{org.currency ? ` · ${org.currency}` : ''}</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowImpersonateModal(true)}
+            className="flex items-center gap-1.5 bg-white/[0.05] border border-white/[0.08] text-white/60 text-[12px] px-3 py-2 rounded-lg hover:bg-white/[0.08] transition-colors"
+          >
+            <ExternalLink className="w-3.5 h-3.5" /> Impersonate
+          </button>
+          <button
+            onClick={() => { setShowDangerConfirm('suspend'); setDangerInput('') }}
+            className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[12px] px-3 py-2 rounded-lg hover:bg-amber-500/15 transition-colors"
+          >
+            <Ban className="w-3.5 h-3.5" /> Suspend
+          </button>
+        </div>
+      </div>
+
+      {/* KPI bar */}
+      <div className="grid grid-cols-4 gap-3">
+        {[
+          { label: 'Total Users', value: users.length, sub: `${users.filter(u => u.is_active !== false).length} active`, icon: Users, color: 'text-blue-400' },
+          { label: 'Tokens (30d)', value: totalTokens30d.toLocaleString(), sub: `${usageSummary.length} model/feature combos`, icon: Zap, color: 'text-amber-400' },
+          { label: 'Open Tickets', value: openTicketCount, sub: `${tickets.length} total`, icon: LifeBuoy, color: 'text-violet-400' },
+          { label: 'Total Invoiced', value: `$${(totalInvoicedCents / 100).toLocaleString()}`, sub: `${invoices.length} invoices`, icon: DollarSign, color: 'text-emerald-400' },
+        ].map(({ label, value, sub, icon: Icon, color }) => (
+          <div key={label} className="bg-[#111118] border border-white/[0.07] rounded-xl p-4">
+            <div className="flex items-center justify-between mb-2">
+              <p className="text-[11px] text-white/40">{label}</p>
+              <Icon className={`w-4 h-4 ${color}`} />
+            </div>
+            <p className="text-[18px] font-bold text-white">{value}</p>
+            <p className="text-[11px] text-white/30 mt-0.5">{sub}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* Tabs */}
+      <div className="flex gap-1 bg-[#0d0d14] border border-white/[0.06] rounded-xl p-1 w-fit flex-wrap">
+        {tabs.map(t => (
+          <button
+            key={t}
+            onClick={() => setTab(t)}
+            className={`px-4 py-2 rounded-lg text-[12px] font-medium transition-all relative ${
+              tab === t
+                ? 'bg-violet-600/30 text-violet-300 border border-violet-500/30'
+                : 'text-white/40 hover:text-white/70'
+            }`}
+          >
+            {t}
+            {t === 'Support' && openTicketCount > 0 && (
+              <span className="absolute -top-1 -right-1 w-3.5 h-3.5 rounded-full bg-red-500 text-[8px] text-white flex items-center justify-center font-bold">
+                {openTicketCount}
+              </span>
+            )}
+          </button>
+        ))}
+      </div>
+
+      {/* Tab content */}
+      {tab === 'Overview' && (
+        <div className="grid grid-cols-3 gap-4">
+          <div className="col-span-2 space-y-4">
+            {/* Recent invoices */}
+            <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-5">
+              <p className="text-[13px] font-semibold text-white mb-4">Recent Invoices</p>
+              <div className="space-y-2">
+                {invoices.length === 0 && <p className="text-[12px] text-white/30">No invoices yet.</p>}
+                {invoices.slice(0, 5).map(inv => (
+                  <div key={inv.id} className="flex items-center justify-between py-2 border-b border-white/[0.04] last:border-0">
+                    <div className="flex items-center gap-3">
+                      <FileText className="w-4 h-4 text-white/30" />
+                      <div>
+                        <p className="text-[12px] font-medium text-white/70">{inv.invoice_number}</p>
+                        <p className="text-[11px] text-white/30">{formatDate(inv.issued_at)}</p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-[13px] font-semibold text-white">${(inv.amount_cents / 100).toLocaleString()}</span>
+                      <span className={`text-[11px] px-2 py-0.5 rounded-full border ${invoiceStatusColor[inv.status] ?? invoiceStatusColor.void}`}>{inv.status}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          {/* Sidebar info */}
+          <div className="space-y-4">
+            <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-5">
+              <p className="text-[12px] font-semibold text-white/60 uppercase tracking-wider mb-4">Account Info</p>
+              <div className="space-y-3">
+                {[
+                  { label: 'Organization', value: org.name, icon: Shield },
+                  { label: 'Joined', value: formatDate(org.created_at), icon: Calendar },
+                  { label: 'Timezone', value: org.timezone || '—', icon: Globe },
+                  { label: 'Currency', value: org.currency || '—', icon: DollarSign },
+                ].map(({ label, value, icon: Icon }) => (
+                  <div key={label} className="flex items-center gap-3">
+                    <Icon className="w-3.5 h-3.5 text-white/30 flex-shrink-0" />
+                    <div>
+                      <p className="text-[10px] text-white/25">{label}</p>
+                      <p className="text-[12px] text-white/70">{value}</p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Notes preview */}
+            {notes && (
+              <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-4">
+                <div className="flex items-center justify-between mb-3">
+                  <p className="text-[12px] font-semibold text-white/60 uppercase tracking-wider">Internal Notes</p>
+                  <button onClick={() => setTab('Notes')} className="text-[10px] text-violet-400 hover:text-violet-300">See all</button>
+                </div>
+                <p className="text-[12px] text-white/60 line-clamp-3">{notes}</p>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {tab === 'Users' && (
+        <div className="bg-[#111118] border border-white/[0.07] rounded-xl overflow-hidden">
+          <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
+            <p className="text-[13px] font-semibold text-white">{users.length} Users</p>
+            <button className="flex items-center gap-1.5 bg-violet-600/20 border border-violet-500/30 text-violet-400 text-[12px] px-3 py-1.5 rounded-lg hover:bg-violet-600/30 transition-colors">
+              <Plus className="w-3.5 h-3.5" /> Add User
+            </button>
+          </div>
+          <table className="w-full">
+            <thead>
+              <tr className="border-b border-white/[0.04]">
+                {['Name', 'Email', 'Role', 'Joined', 'Status', ''].map(h => (
+                  <th key={h} className="text-left text-[11px] font-medium text-white/30 px-5 py-3">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {users.length === 0 && (
+                <tr><td colSpan={6} className="px-5 py-8 text-center text-[12px] text-white/30">No users found.</td></tr>
+              )}
+              {users.map(u => (
+                <tr key={u.id} className="border-b border-white/[0.04] hover:bg-white/[0.02] group">
+                  <td className="px-5 py-3">
+                    <div className="flex items-center gap-2">
+                      <div className="w-7 h-7 rounded-full bg-gradient-to-br from-violet-500 to-indigo-600 flex items-center justify-center text-[10px] font-bold">
+                        {(u.full_name || '?').charAt(0)}
+                      </div>
+                      <span className="text-[13px] font-medium text-white/80">{u.full_name || 'Unnamed'}</span>
+                    </div>
+                  </td>
+                  <td className="px-5 py-3 text-[12px] text-white/50">{u.email || '—'}</td>
+                  <td className="px-5 py-3">
+                    <span className={`text-[11px] px-2 py-0.5 rounded font-medium ${
+                      u.role === 'admin' || u.role === 'super_admin' ? 'bg-violet-500/10 text-violet-400' : 'bg-white/[0.05] text-white/50'
+                    }`}>{u.role || 'user'}</span>
+                  </td>
+                  <td className="px-5 py-3 text-[12px] text-white/40">{formatDate(u.created_at)}</td>
+                  <td className="px-5 py-3">
+                    <div className="flex items-center gap-1.5">
+                      <div className={`w-1.5 h-1.5 rounded-full ${u.is_active === false ? 'bg-white/20' : 'bg-emerald-400'}`} />
+                      <span className={`text-[11px] ${u.is_active === false ? 'text-white/30' : 'text-emerald-400'}`}>{u.is_active === false ? 'inactive' : 'active'}</span>
+                    </div>
+                  </td>
+                  <td className="px-5 py-3">
+                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                      <button className="text-[11px] text-white/40 hover:text-white/70 px-2 py-1 rounded border border-white/[0.06] hover:border-white/[0.15] transition-colors">Edit</button>
+                      <button className="text-[11px] text-red-400 hover:text-red-300 px-2 py-1 rounded border border-red-500/20 hover:border-red-500/40 transition-colors">Remove</button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {tab === 'Billing' && (
+        <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-5">
+          <div className="flex items-center justify-between mb-4">
+            <p className="text-[13px] font-semibold text-white">Invoice History</p>
+            <button className="text-[12px] text-violet-400 hover:text-violet-300 flex items-center gap-1">
+              <Plus className="w-3.5 h-3.5" /> Issue Invoice
+            </button>
+          </div>
+          {invoices.length === 0 && <p className="text-[12px] text-white/30">No invoices yet.</p>}
+          {invoices.map(inv => (
+            <div key={inv.id} className="flex items-center justify-between py-3 border-b border-white/[0.05] last:border-0">
+              <div className="flex items-center gap-3">
+                <div className="w-8 h-8 rounded-lg bg-white/[0.04] border border-white/[0.06] flex items-center justify-center">
+                  <FileText className="w-4 h-4 text-white/30" />
+                </div>
+                <div>
+                  <p className="text-[13px] font-medium text-white/80">{inv.invoice_number}</p>
+                  <p className="text-[11px] text-white/30">{formatDate(inv.issued_at)}</p>
+                </div>
+              </div>
+              <div className="flex items-center gap-4">
+                <p className="text-[14px] font-semibold text-white">${(inv.amount_cents / 100).toLocaleString()}</p>
+                <span className={`text-[11px] px-2.5 py-0.5 rounded-full font-medium border ${invoiceStatusColor[inv.status] ?? invoiceStatusColor.void}`}>{inv.status}</span>
+                <button className="text-[11px] text-white/30 hover:text-white/60">Download</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {tab === 'Usage' && (
+        <div className="bg-[#111118] border border-white/[0.07] rounded-xl overflow-hidden">
+          <div className="px-5 py-4 border-b border-white/[0.06]">
+            <p className="text-[13px] font-semibold text-white">Token Usage — Last 30 Days</p>
+            <p className="text-[11px] text-white/30 mt-0.5">{totalTokens30d.toLocaleString()} total tokens across {usageSummary.length} model/feature combinations</p>
+          </div>
+          <table className="w-full">
+            <thead>
+              <tr className="border-b border-white/[0.04]">
+                {['Model', 'Feature', 'Tokens', 'Est. Cost'].map(h => (
+                  <th key={h} className="text-left text-[11px] font-medium text-white/30 px-5 py-3">{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {usageSummary.length === 0 && (
+                <tr><td colSpan={4} className="px-5 py-8 text-center text-[12px] text-white/30">No usage recorded in the last 30 days.</td></tr>
+              )}
+              {usageSummary.map((r, i) => (
+                <tr key={i} className="border-b border-white/[0.04] hover:bg-white/[0.02]">
+                  <td className="px-5 py-3 text-[12px] text-white/70">{r.model}</td>
+                  <td className="px-5 py-3 text-[12px] text-white/50">{r.feature}</td>
+                  <td className="px-5 py-3 text-[13px] font-medium text-white/80">{Number(r.total_tokens).toLocaleString()}</td>
+                  <td className="px-5 py-3 text-[13px] text-white/60">${Number(r.estimated_cost_usd).toFixed(4)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {tab === 'Support' && (
+        <div className="bg-[#111118] border border-white/[0.07] rounded-xl overflow-hidden">
+          {tickets.length === 0 ? (
+            <div className="p-8 text-center">
+              <LifeBuoy className="w-8 h-8 text-white/20 mx-auto mb-3" />
+              <p className="text-[14px] text-white/50 font-medium">No support tickets</p>
+              <p className="text-[12px] text-white/25 mt-1">This client has no tickets on record.</p>
+              <button className="mt-4 px-4 py-2 rounded-lg bg-violet-600/20 border border-violet-500/30 text-[12px] text-violet-400 hover:bg-violet-600/30 transition-colors">
+                Create Ticket
+              </button>
+            </div>
+          ) : (
+            <table className="w-full">
+              <thead>
+                <tr className="border-b border-white/[0.04]">
+                  {['Ticket', 'Subject', 'Priority', 'Status', 'Category', 'Messages', 'Created'].map(h => (
+                    <th key={h} className="text-left text-[11px] font-medium text-white/30 px-5 py-3">{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {tickets.map(t => (
+                  <tr key={t.id} className="border-b border-white/[0.04] hover:bg-white/[0.02]">
+                    <td className="px-5 py-3 text-[12px] text-white/50 font-mono">{t.ticket_number ?? t.id.slice(0, 8)}</td>
+                    <td className="px-5 py-3 text-[13px] text-white/80">{t.subject ?? '—'}</td>
+                    <td className="px-5 py-3 text-[12px] text-white/50 capitalize">{t.priority ?? '—'}</td>
+                    <td className="px-5 py-3">
+                      <span className={`text-[11px] px-2 py-0.5 rounded-full border ${ticketStatusColor[t.status ?? ''] ?? ticketStatusColor.closed}`}>{t.status ?? 'unknown'}</span>
+                    </td>
+                    <td className="px-5 py-3 text-[12px] text-white/50">{t.category ?? '—'}</td>
+                    <td className="px-5 py-3 text-[12px] text-white/40">{t.message_count ?? 0}</td>
+                    <td className="px-5 py-3 text-[12px] text-white/40">{formatDate(t.created_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      )}
+
+      {/* Internal Notes tab */}
+      {tab === 'Notes' && (
+        <div className="space-y-4">
+          <div className="bg-amber-500/5 border border-amber-500/15 rounded-xl px-4 py-3 flex items-center gap-3">
+            <Lock className="w-4 h-4 text-amber-400 flex-shrink-0" />
+            <p className="text-[12px] text-amber-300/70">These notes are internal only — never visible to the client.</p>
+          </div>
+
+          <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-4">
+            <textarea
+              value={notes}
+              onChange={e => setNotes(e.target.value)}
+              rows={6}
+              className="w-full bg-transparent text-[13px] text-white/80 placeholder:text-white/25 outline-none resize-none"
+              placeholder="No internal notes yet. Add context, flag risk, or leave updates for teammates…"
+            />
+            <div className="flex items-center justify-between mt-3 pt-3 border-t border-white/[0.06]">
+              <span className="text-[11px] text-white/25">Visible only to Magnivo team</span>
+              <button
+                disabled
+                title="Saving is not wired up yet"
+                className="flex items-center gap-1.5 bg-violet-600/40 cursor-not-allowed text-white/60 text-[12px] font-medium px-4 py-1.5 rounded-lg"
+              >
+                <Send className="w-3.5 h-3.5" /> Save Notes
+              </button>
+            </div>
+          </div>
+
+          {!notes && (
+            <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-8 text-center">
+              <MessageSquare className="w-7 h-7 text-white/15 mx-auto mb-3" />
+              <p className="text-[13px] text-white/30">No internal notes yet.</p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'Settings' && (
+        <div className="grid grid-cols-2 gap-4">
+          <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-5">
+            <div className="flex items-center justify-between mb-4">
+              <p className="text-[13px] font-semibold text-white">Organization Details</p>
+              <button className="text-[11px] text-violet-400 flex items-center gap-1 hover:text-violet-300">
+                <Edit2 className="w-3 h-3" /> Edit
+              </button>
+            </div>
+            <div className="space-y-3">
+              {[
+                { label: 'Company Name', value: org.name },
+                { label: 'Timezone', value: org.timezone || '—' },
+                { label: 'Currency', value: org.currency || '—' },
+                { label: 'Joined', value: formatDate(org.created_at) },
+              ].map(f => (
+                <div key={f.label} className="flex items-center justify-between py-2 border-b border-white/[0.04] last:border-0">
+                  <span className="text-[12px] text-white/40">{f.label}</span>
+                  <span className="text-[12px] font-medium text-white/80">{f.value}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div className="bg-red-950/20 border border-red-500/20 rounded-xl p-5">
+            <p className="text-[13px] font-semibold text-red-400 mb-1">Danger Zone</p>
+            <p className="text-[12px] text-white/40 mb-4">These actions are irreversible. A typed confirmation is required.</p>
+            <div className="space-y-2">
+              <button
+                onClick={() => { setShowDangerConfirm('suspend'); setDangerInput('') }}
+                className="w-full py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[12px] text-amber-400 hover:bg-amber-500/15 transition-colors"
+              >
+                Suspend Organization
+              </button>
+              <button
+                onClick={() => { setShowDangerConfirm('delete'); setDangerInput('') }}
+                className="w-full py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-[12px] text-red-400 hover:bg-red-500/15 transition-colors"
+              >
+                Delete Organization
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab === 'Audit' && (
+        <div className="bg-[#111118] border border-white/[0.07] rounded-xl overflow-hidden">
+          {auditLogs.length === 0 ? (
+            <div className="p-8 text-center">
+              <BarChart2 className="w-8 h-8 text-white/20 mx-auto mb-3" />
+              <p className="text-[14px] text-white/50 font-medium">No audit events</p>
+              <p className="text-[12px] text-white/25 mt-1">No actions have been logged for this client yet.</p>
+            </div>
+          ) : (
+            <div className="divide-y divide-white/[0.04]">
+              {auditLogs.map((log, i) => (
+                <div key={log.id ?? i} className="flex items-start gap-3 px-5 py-3">
+                  <Activity className="w-3.5 h-3.5 text-white/30 mt-0.5 flex-shrink-0" />
+                  <div className="flex-1">
+                    <p className="text-[12px] text-white/70">
+                      <span className="font-medium">{log.action ?? log.event_type ?? 'Event'}</span>
+                      {(log.actor_email ?? log.performed_by) && <span className="text-white/40"> — by {log.actor_email ?? log.performed_by}</span>}
+                    </p>
+                    {(log.details ?? log.description) && (
+                      <p className="text-[11px] text-white/40 mt-0.5">{log.details ?? log.description}</p>
+                    )}
+                  </div>
+                  <span className="text-[10px] text-white/25 whitespace-nowrap">{formatDateTime(log.created_at)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {tab === 'Integrations' && (
+        <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-8 text-center">
+          <BarChart2 className="w-8 h-8 text-white/20 mx-auto mb-3" />
+          <p className="text-[14px] text-white/50 font-medium">Integrations — Coming Soon</p>
+          <p className="text-[12px] text-white/25 mt-1">This section is under active development.</p>
+        </div>
+      )}
+
+      {/* Impersonation modal */}
+      {showImpersonateModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowImpersonateModal(false)}>
+          <div className="bg-[#111118] border border-white/[0.12] rounded-2xl p-6 w-full max-w-md" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center gap-3 mb-4">
+              <div className="w-9 h-9 rounded-xl bg-amber-500/15 flex items-center justify-center">
+                <ExternalLink className="w-4.5 h-4.5 text-amber-400" />
+              </div>
+              <div>
+                <h2 className="text-[15px] font-semibold text-white">Impersonate {org.name}</h2>
+                <p className="text-[11px] text-white/40">View the platform exactly as this client sees it</p>
+              </div>
+            </div>
+            <div className="bg-amber-500/8 border border-amber-500/20 rounded-lg p-3 mb-5 space-y-1.5">
+              {[
+                'Session auto-expires after 30 minutes',
+                'Sensitive actions (billing, suspension) are blocked',
+                'This entire session will be recorded in the audit log',
+              ].map(w => (
+                <div key={w} className="flex items-start gap-2">
+                  <AlertCircle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0 mt-0.5" />
+                  <p className="text-[11px] text-amber-300/70">{w}</p>
+                </div>
+              ))}
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => setShowImpersonateModal(false)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+              <button onClick={() => setShowImpersonateModal(false)} className="flex-1 py-2 rounded-lg bg-amber-600/80 hover:bg-amber-600 text-[13px] text-white font-medium transition-colors">Start Session</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Danger action confirm modal */}
+      {showDangerConfirm && (() => {
+        const action = dangerActions[showDangerConfirm]
+        const isRed = action.color === 'red'
+        return (
+          <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowDangerConfirm(null)}>
+            <div className="bg-[#111118] border border-white/[0.12] rounded-2xl p-6 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+              <h2 className={`text-[15px] font-semibold mb-2 ${isRed ? 'text-red-400' : 'text-amber-400'}`}>{action.label}</h2>
+              <p className="text-[12px] text-white/40 mb-4">
+                Type <span className={`font-mono font-bold ${isRed ? 'text-red-400' : 'text-amber-400'}`}>{action.confirmWord}</span> to confirm this action.
+              </p>
+              <input
+                value={dangerInput}
+                onChange={e => setDangerInput(e.target.value)}
+                className={`w-full bg-white/[0.04] border rounded-lg px-3 py-2 text-[13px] text-white outline-none mb-4 ${isRed ? 'border-red-500/30 focus:border-red-500/60' : 'border-amber-500/30 focus:border-amber-500/60'}`}
+                placeholder={action.confirmWord}
+              />
+              <div className="flex gap-2">
+                <button onClick={() => setShowDangerConfirm(null)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+                <button
+                  disabled={dangerInput !== action.confirmWord}
+                  className={`flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${isRed ? 'bg-red-600 hover:bg-red-500' : 'bg-amber-600 hover:bg-amber-500'}`}
+                >
+                  Confirm
+                </button>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+    </div>
+  )
+}
