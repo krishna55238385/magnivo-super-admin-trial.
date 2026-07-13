@@ -4,6 +4,7 @@ import "./globals.css";
 import { Toaster } from "@/components/ui/sonner"
 import { UIProvider } from "@/components/providers/UIProvider";
 import { getCurrentUser } from "@/app/actions/crm";
+import { DebugErrorBoundary } from "@/components/super-admin/DebugErrorBoundary";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -62,7 +63,7 @@ export default async function RootLayout({
           React hydrates, which is harmless but otherwise logs a mismatch. */}
       <body suppressHydrationWarning className={`${geistSans.variable} ${geistMono.variable} antialiased`}>
         <UIProvider initialSettings={user?.appearance_settings}>
-          {children}
+          <DebugErrorBoundary>{children}</DebugErrorBoundary>
           <Toaster />
         </UIProvider>
       </body>
