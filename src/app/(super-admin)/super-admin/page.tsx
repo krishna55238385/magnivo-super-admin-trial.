@@ -61,6 +61,9 @@ export default async function SuperAdminDashboard() {
     getPlanBreakdown(),
   ])
 
+  console.log('planBreakdown:', JSON.stringify(planBreakdownRaw))
+  console.log('topClients:', JSON.stringify(topClientsRaw))
+
   const mrrData = mrrTrend.map((r: any) => ({
     month: new Date(r.month).toLocaleDateString('en-US', { month: 'short' }),
     mrr: r.mrr_cents / 100,

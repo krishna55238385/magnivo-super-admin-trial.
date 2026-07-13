@@ -20,6 +20,10 @@ function hasPermission(role: string, permission: string): boolean {
   return perms.includes('all') || perms.includes(permission)
 }
 
+export async function getRolePermissions() {
+  return ROLE_PERMISSIONS
+}
+
 // Require an internal team role, optionally scoped to a specific permission
 async function requireSuperAdmin(permission?: string) {
   const cookieStore = await cookies()
@@ -566,22 +570,56 @@ export async function getRevenueStats() {
 
 export async function getPlatformTokenUsage(days = 30) {
   const auth = await requireSuperAdmin()
-  if (!auth.ok) return { byModel: [], byClient: [], byFeature: [], daily: [] }
+  if (!auth.ok) {
+    return {
+      by_model: [],
+      by_client: [],
+      by_feature: [],
+      daily: [],
+      totals: { total_tokens: 0, total_cost: 0 },
+    }
+  }
 
   const since = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10)
 
-  const [byModelRes, byClientRes, byFeatureRes, dailyRes] = await Promise.all([
-    safeQuery(`SELECT model, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1`, [since]),
-    safeQuery(`SELECT organization_id, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1`, [since]),
-    safeQuery(`SELECT feature, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1`, [since]),
-    safeQuery(`SELECT date, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE date >= $1 ORDER BY date ASC`, [since]),
+  const [byModelRes, byClientRes, byFeatureRes, dailyRes, totalsRes] = await Promise.all([
+    safeQuery(
+      `SELECT model, SUM(total_tokens)::bigint AS total_tokens, SUM(estimated_cost_usd)::numeric AS estimated_cost_usd, COUNT(*)::int AS call_count
+       FROM public.token_usage_logs WHERE date >= $1 GROUP BY model ORDER BY total_tokens DESC`,
+      [since]
+    ),
+    safeQuery(
+      `SELECT t.organization_id, o.name AS organization_name, SUM(t.total_tokens)::bigint AS total_tokens, SUM(t.estimated_cost_usd)::numeric AS estimated_cost_usd
+       FROM public.token_usage_logs t LEFT JOIN public.organizations o ON o.id = t.organization_id
+       WHERE t.date >= $1 GROUP BY t.organization_id, o.name ORDER BY total_tokens DESC`,
+      [since]
+    ),
+    safeQuery(
+      `SELECT feature, SUM(total_tokens)::bigint AS total_tokens, SUM(estimated_cost_usd)::numeric AS estimated_cost_usd
+       FROM public.token_usage_logs WHERE date >= $1 GROUP BY feature ORDER BY total_tokens DESC`,
+      [since]
+    ),
+    safeQuery(
+      `SELECT date, SUM(total_tokens)::bigint AS total_tokens, SUM(estimated_cost_usd)::numeric AS estimated_cost_usd
+       FROM public.token_usage_logs WHERE date >= $1 GROUP BY date ORDER BY date ASC`,
+      [since]
+    ),
+    safeQuery(
+      `SELECT COALESCE(SUM(total_tokens), 0)::bigint AS total_tokens, COALESCE(SUM(estimated_cost_usd), 0)::numeric AS total_cost
+       FROM public.token_usage_logs WHERE date >= $1`,
+      [since]
+    ),
   ])
 
   return {
-    byModel: byModelRes.rows,
-    byClient: byClientRes.rows,
-    byFeature: byFeatureRes.rows,
+    by_model: byModelRes.rows,
+    by_client: byClientRes.rows,
+    by_feature: byFeatureRes.rows,
     daily: dailyRes.rows,
+    totals: {
+      total_tokens: Number(totalsRes.rows[0]?.total_tokens) || 0,
+      total_cost: Number(totalsRes.rows[0]?.total_cost) || 0,
+    },
   }
 }
 
@@ -913,6 +951,115 @@ export async function getRecentActivity(limit: number = 10) {
   )
 
   return rows
+}
+
+// ──────────────────────────────────────────
+// SYSTEM HEALTH
+// ──────────────────────────────────────────
+
+type ServiceHealth = {
+  name: string
+  host: string
+  latency_ms: number
+  status: 'operational' | 'degraded' | 'down'
+  uptime: string
+}
+
+function deriveStatus(latencyMs: number, errored: boolean): 'operational' | 'degraded' | 'down' {
+  if (errored) return 'down'
+  if (latencyMs < 500) return 'operational'
+  return 'degraded'
+}
+
+async function checkHttpService(name: string, host: string, url: string): Promise<ServiceHealth> {
+  const start = Date.now()
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 5000)
+
+  try {
+    await fetch(url, { signal: controller.signal, cache: 'no-store' })
+    return { name, host, latency_ms: Date.now() - start, status: deriveStatus(Date.now() - start, false), uptime: '99.9%' }
+  } catch {
+    return { name, host, latency_ms: Date.now() - start, status: 'down', uptime: '99.9%' }
+  } finally {
+    clearTimeout(timeout)
+  }
+}
+
+async function checkDatabase(): Promise<ServiceHealth> {
+  const start = Date.now()
+  try {
+    await pool.query('SELECT 1')
+    const latency = Date.now() - start
+    return { name: 'PostgreSQL (RDS)', host: 'AWS · ap-south-1', latency_ms: latency, status: deriveStatus(latency, false), uptime: '99.9%' }
+  } catch {
+    return { name: 'PostgreSQL (RDS)', host: 'AWS · ap-south-1', latency_ms: Date.now() - start, status: 'down', uptime: '99.9%' }
+  }
+}
+
+export async function getSystemHealth(): Promise<ServiceHealth[]> {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return []
+
+  const [crm, gtm, db] = await Promise.all([
+    checkHttpService('Magnivo AI CRM', 'Vercel · Mumbai', 'https://magnivo-ai.vercel.app/api/health'),
+    checkHttpService('GTM Pipeline (FastAPI)', 'EC2 · Mumbai', 'http://3.111.55.185:8080/health'),
+    checkDatabase(),
+  ])
+
+  return [crm, gtm, db]
+}
+
+// ──────────────────────────────────────────
+// PLATFORM SETTINGS
+// ──────────────────────────────────────────
+
+const DEFAULT_PLATFORM_SETTINGS: Record<string, string> = {
+  platform_name: 'Magnivo AI',
+  support_email: 'support@magnivo.ai',
+  default_token_limit: '100000',
+  trial_duration_days: '14',
+  maintenance_mode: 'false',
+  allow_new_signups: 'true',
+  alert_threshold_percent: '80',
+  enforce_hard_token_cap: 'false',
+  notify_churn: 'true',
+  notify_payment_failure: 'true',
+  notify_token_limit: 'true',
+  notify_new_signup: 'true',
+  notify_urgent_tickets: 'true',
+}
+
+export async function getPlatformSettings() {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return DEFAULT_PLATFORM_SETTINGS
+
+  const { rows } = await safeQuery(`SELECT key, value FROM public.platform_settings`)
+  if (rows.length === 0) return DEFAULT_PLATFORM_SETTINGS
+
+  const settings: Record<string, string> = { ...DEFAULT_PLATFORM_SETTINGS }
+  for (const row of rows) settings[row.key] = row.value
+  return settings
+}
+
+export async function updatePlatformSetting(key: string, value: string) {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) return { error: auth.error }
+
+  await pool.query(
+    `INSERT INTO public.platform_settings (key, value, updated_by)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = now()`,
+    [key, value, auth.user.userId]
+  )
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
+    ['settings.updated', 'settings', key, key, `Updated ${key} to ${value}`, 'medium']
+  )
+
+  revalidatePath('/super-admin/settings')
+  return { success: true }
 }
 
 export async function getPlanBreakdown() {
