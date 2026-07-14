@@ -24,6 +24,8 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
     }
 
+    await pool.query(`UPDATE public.internal_team SET last_login_at = now() WHERE id = $1`, [user.id])
+
     const token = jwt.sign(
       { userId: user.id, email: user.email, role: user.role, fullName: user.full_name },
       JWT_SECRET,

@@ -14,6 +14,7 @@ export default async function TeamPage() {
     email: m.email,
     role: m.role,
     department: m.department ?? null,
+    status: m.status,
     last_login_at: m.last_login_at ?? null,
     created_at: m.created_at,
   }))

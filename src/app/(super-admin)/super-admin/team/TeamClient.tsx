@@ -10,6 +10,7 @@ type TeamMember = {
   email: string
   role: string
   department: string | null
+  status: string
   last_login_at: string | null
   created_at: string
 }
@@ -32,6 +33,11 @@ const PERMISSION_LABELS: Record<string, string> = {
   manage_support: 'Manage Support',
   view_team: 'View Team',
   view_audit: 'View Audit Logs',
+}
+
+const STATUS_LABELS: Record<string, string> = {
+  pending: 'Invited',
+  active: 'Active',
 }
 
 function timeAgo(iso: string | null) {
@@ -94,7 +100,7 @@ export default function TeamClient({ team, rolePermissions }: { team: TeamMember
               <tbody>
                 {team.map(m => {
                   const r = roleConfig[m.role] ?? { color: 'text-white/40 bg-white/[0.04] border-white/[0.1]', label: m.role, description: '' }
-                  const status = m.last_login_at ? 'active' : 'invited'
+                  const status = STATUS_LABELS[m.status] ?? m.status
                   return (
                     <tr key={m.id} className="border-b border-white/[0.04] hover:bg-white/[0.02] group">
                       <td className="px-5 py-3">
@@ -113,8 +119,8 @@ export default function TeamClient({ team, rolePermissions }: { team: TeamMember
                       </td>
                       <td className="px-5 py-3 text-[12px] text-white/50">{m.department ?? '—'}</td>
                       <td className="px-5 py-3">
-                        <div className={`inline-flex items-center gap-1.5 text-[11px] ${status === 'active' ? 'text-emerald-400' : 'text-amber-400'}`}>
-                          <div className={`w-1.5 h-1.5 rounded-full ${status === 'active' ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                        <div className={`inline-flex items-center gap-1.5 text-[11px] ${m.status === 'active' ? 'text-emerald-400' : 'text-amber-400'}`}>
+                          <div className={`w-1.5 h-1.5 rounded-full ${m.status === 'active' ? 'bg-emerald-400' : 'bg-amber-400'}`} />
                           {status}
                         </div>
                       </td>

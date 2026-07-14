@@ -938,7 +938,7 @@ export async function acceptTeamInvite(data: { token: string; fullName: string; 
 
   const updateRes = await pool.query(
     `UPDATE public.internal_team
-     SET password_hash = $1, full_name = $2, status = 'active', invite_token = NULL, invite_expires_at = NULL
+     SET password_hash = $1, full_name = $2, status = 'active', invite_token = NULL, invite_expires_at = NULL, last_login_at = now()
      WHERE id = $3 AND invite_token = $4`,
     [passwordHash, fullName, member.id, data.token]
   )
