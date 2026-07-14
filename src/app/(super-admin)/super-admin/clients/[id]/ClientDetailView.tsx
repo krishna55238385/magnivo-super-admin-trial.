@@ -9,7 +9,7 @@ import {
   LifeBuoy, BarChart2, MessageSquare, Send, Clock, Lock, X, Activity
 } from 'lucide-react'
 import Link from 'next/link'
-import { suspendClient, changeClientPlan } from '@/app/actions/super-admin'
+import { suspendClient, changeClientPlan, updateClientNotes } from '@/app/actions/super-admin'
 
 type Org = { id: string; name: string; created_at: string; timezone?: string | null; currency?: string | null; logo_url?: string | null }
 type User = { id: string; full_name: string | null; role: string | null; email?: string | null; is_active?: boolean | null; created_at?: string }
@@ -84,6 +84,8 @@ export default function ClientDetailView({
   const [planPending, setPlanPending] = useState(false)
   const [planError, setPlanError] = useState<string | null>(null)
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+  const [notesPending, setNotesPending] = useState(false)
+  const [notesError, setNotesError] = useState<string | null>(null)
 
   const dangerActions: Record<string, { label: string; confirmWord: string; color: string }> = {
     suspend: { label: 'Suspend Organization', confirmWord: 'SUSPEND', color: 'amber' },
@@ -141,6 +143,18 @@ export default function ClientDetailView({
     setClientPlan(selectedPlan)
     setShowPlanModal(false)
     setToast({ type: 'success', text: `${org.name}'s plan changed to ${selectedPlan}.` })
+  }
+
+  async function handleSaveNotes() {
+    setNotesPending(true)
+    setNotesError(null)
+    const result = await updateClientNotes(org.id, notes)
+    setNotesPending(false)
+    if (result?.error) {
+      setNotesError(result.error)
+      return
+    }
+    setToast({ type: 'success', text: 'Notes saved.' })
   }
 
   const totalTokens30d = usageSummary.reduce((sum, r) => sum + (Number(r.total_tokens) || 0), 0)
@@ -470,7 +484,7 @@ export default function ClientDetailView({
           <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-4">
             <textarea
               value={notes}
-              onChange={e => setNotes(e.target.value)}
+              onChange={e => { setNotes(e.target.value); setNotesError(null) }}
               rows={6}
               className="w-full bg-transparent text-[13px] text-white/80 placeholder:text-white/25 outline-none resize-none"
               placeholder="No internal notes yet. Add context, flag risk, or leave updates for teammates…"
@@ -478,13 +492,14 @@ export default function ClientDetailView({
             <div className="flex items-center justify-between mt-3 pt-3 border-t border-white/[0.06]">
               <span className="text-[11px] text-white/25">Visible only to Magnivo team</span>
               <button
-                disabled
-                title="Saving is not wired up yet"
-                className="flex items-center gap-1.5 bg-violet-600/40 cursor-not-allowed text-white/60 text-[12px] font-medium px-4 py-1.5 rounded-lg"
+                onClick={handleSaveNotes}
+                disabled={notesPending}
+                className="flex items-center gap-1.5 bg-violet-600 hover:bg-violet-500 disabled:opacity-50 disabled:cursor-not-allowed text-white text-[12px] font-medium px-4 py-1.5 rounded-lg transition-colors"
               >
-                <Send className="w-3.5 h-3.5" /> Save Notes
+                <Send className="w-3.5 h-3.5" /> {notesPending ? 'Saving…' : 'Save Notes'}
               </button>
             </div>
+            {notesError && <p className="text-[11px] text-red-400 mt-2">{notesError}</p>}
           </div>
 
           {!notes && (

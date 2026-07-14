@@ -203,11 +203,20 @@ export async function updateClientNotes(orgId: string, notes: string) {
   const auth = await requireSuperAdmin()
   if (!auth.ok) return { error: auth.error }
 
-  await pool.query(
+  const updateRes = await pool.query(
     `UPDATE public.onboarding_tracker SET notes = $2 WHERE organization_id = $1`,
     [orgId, notes]
   )
+  if (updateRes.rowCount === 0) {
+    return { error: 'No onboarding record found for this organization' }
+  }
 
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['client.notes_updated', 'client', orgId, JSON.stringify({ message: 'Internal notes updated' }), 'low']
+  )
+
+  revalidatePath(`/super-admin/clients/${orgId}`)
   return { success: true }
 }
 
@@ -220,63 +229,67 @@ export async function onboardClient(data: {
   const auth = await requireSuperAdmin()
   if (!auth.ok) return { error: auth.error }
 
+  const trialEnd = new Date()
+  trialEnd.setDate(trialEnd.getDate() + 14)
+
+  // NOTE: this creates a real organization_invites row (same mechanism the CRM's
+  // inviteUser() uses) and returns the link for the super admin to hand off manually.
+  // No email is sent automatically yet — that's a separate follow-up task.
+  const client = await pool.connect()
   let org
+  let inviteToken
   try {
-    const orgRes = await pool.query(
+    await client.query('BEGIN')
+
+    const orgRes = await client.query(
       `INSERT INTO public.organizations (name, timezone, currency) VALUES ($1, 'UTC', 'USD') RETURNING id`,
       [data.companyName]
     )
     org = orgRes.rows[0]
+
+    await client.query(
+      `INSERT INTO public.client_subscriptions (organization_id, plan_name, status, mrr_cents, payment_status, trial_ends_at)
+       VALUES ($1, $2, 'trial', 0, 'trial', $3)`,
+      [org.id, data.plan, trialEnd.toISOString()]
+    )
+
+    const inviteRes = await client.query(
+      `INSERT INTO public.organization_invites (organization_id, email, role, invited_by)
+       VALUES ($1, $2, 'admin', NULL) RETURNING token`,
+      [org.id, data.adminEmail]
+    )
+    inviteToken = inviteRes.rows[0].token
+
+    await client.query(
+      `INSERT INTO public.onboarding_tracker
+         (organization_id, nda_status, msa_status, onboarding_form_status, data_auth_status, invoice_status, notes)
+       VALUES ($1, 'not_sent', 'not_sent', 'not_sent', 'not_sent', 'not_issued', $2)`,
+      [org.id, `Admin invite link generated for ${data.adminEmail} (domain: ${data.domain}). Link was shown to the super admin on creation — no email sent automatically.`]
+    )
+
+    await client.query(
+      `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        'client.onboarded',
+        'client',
+        data.companyName,
+        JSON.stringify({ message: `Onboarded ${data.companyName} on ${data.plan} plan`, organization_id: org.id }),
+        'low',
+      ]
+    )
+
+    await client.query('COMMIT')
   } catch (err: any) {
-    return { error: err.message || 'Failed to create organization' }
+    await client.query('ROLLBACK')
+    return { error: err.message || 'Failed to onboard client' }
+  } finally {
+    client.release()
   }
-
-  if (!org) return { error: 'Failed to create organization' }
-
-  const { rows: planRows } = await safeQuery(`SELECT * FROM public.plans WHERE name = $1`, [data.plan])
-  const plan = planRows[0]
-
-  const trialEnd = new Date()
-  trialEnd.setDate(trialEnd.getDate() + 14)
-
-  await pool.query(
-    `INSERT INTO public.client_subscriptions (organization_id, plan_id, plan_name, status, mrr_cents, token_limit, trial_ends_at, payment_status)
-     VALUES ($1, $2, $3, 'trial', 0, $4, $5, 'trial')`,
-    [org.id, plan?.id || null, data.plan, plan?.token_limit || 10000000, trialEnd.toISOString()]
-  )
-
-  await pool.query(
-    `INSERT INTO public.onboarding_tracker (organization_id, steps) VALUES ($1, $2)`,
-    [
-      org.id,
-      JSON.stringify([
-        { key: 'signup', label: 'Account Created', done: true, ts: new Date().toISOString() },
-        { key: 'invite', label: 'Admin Invited', done: false, ts: null },
-        { key: 'profile', label: 'Profile Completed', done: false, ts: null },
-        { key: 'integrations', label: 'Email Connected', done: false, ts: null },
-        { key: 'icp', label: 'ICP Profile Created', done: false, ts: null },
-        { key: 'first_run', label: 'First GTM Run', done: false, ts: null },
-        { key: 'payment', label: 'Payment Method Added', done: false, ts: null },
-        { key: 'converted', label: 'Converted to Paid', done: false, ts: null },
-      ]),
-    ]
-  )
-
-  await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [
-      'client.onboarded',
-      'client',
-      data.companyName,
-      JSON.stringify({ message: `Onboarded ${data.companyName} on ${data.plan} plan`, organization_id: org.id }),
-      'low',
-    ]
-  )
 
   revalidatePath('/super-admin/clients')
   revalidatePath('/super-admin/onboarding')
-  return { success: true, orgId: org.id }
+  return { success: true, orgId: org.id, inviteLink: `https://magnivo-ai.vercel.app/invite/${inviteToken}` }
 }
 
 export async function suspendClient(orgId: string, reason: string) {

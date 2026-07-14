@@ -8,7 +8,7 @@ import {
   Bookmark, X, CheckSquare, Square, CheckCircle2, Clock3,
 } from 'lucide-react'
 import Link from 'next/link'
-import { suspendClient, changeClientPlan } from '@/app/actions/super-admin'
+import { suspendClient, changeClientPlan, onboardClient } from '@/app/actions/super-admin'
 
 export type Client = {
   id: string
@@ -77,6 +77,12 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
   const [onboardingFilter, setOnboardingFilter] = useState('all')
   const [openMenu, setOpenMenu] = useState<string | null>(null)
   const [showOnboardModal, setShowOnboardModal] = useState(false)
+  const [onboardForm, setOnboardForm] = useState({ companyName: '', adminEmail: '', domain: '', plan: 'Starter' })
+  const [onboardErrors, setOnboardErrors] = useState<Record<string, string>>({})
+  const [onboardPending, setOnboardPending] = useState(false)
+  const [onboardError, setOnboardError] = useState<string | null>(null)
+  const [onboardInviteLink, setOnboardInviteLink] = useState<string | null>(null)
+  const [linkCopied, setLinkCopied] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [savedViews, setSavedViews] = useState<SavedView[]>(DEFAULT_SAVED_VIEWS)
   const [showSaveViewModal, setShowSaveViewModal] = useState(false)
@@ -142,6 +148,60 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
     setSavedViews(prev => [...prev, { name: newViewName.trim(), status: statusFilter, plan: planFilter, payment: paymentFilter }])
     setNewViewName('')
     setShowSaveViewModal(false)
+  }
+
+  function openOnboardModal() {
+    setOnboardForm({ companyName: '', adminEmail: '', domain: '', plan: 'Starter' })
+    setOnboardErrors({})
+    setOnboardError(null)
+    setOnboardInviteLink(null)
+    setLinkCopied(false)
+    setShowOnboardModal(true)
+  }
+
+  function closeOnboardModal() {
+    if (onboardPending) return
+    const hadSuccess = !!onboardInviteLink
+    setShowOnboardModal(false)
+    if (hadSuccess) router.refresh()
+  }
+
+  function validateOnboardForm() {
+    const errors: Record<string, string> = {}
+    if (!onboardForm.companyName.trim()) errors.companyName = 'Company name is required'
+    if (!onboardForm.adminEmail.trim()) errors.adminEmail = 'Admin email is required'
+    else if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(onboardForm.adminEmail.trim())) errors.adminEmail = 'Enter a valid email address'
+    if (!onboardForm.domain.trim()) errors.domain = 'Domain is required'
+    else if (!/^[a-zA-Z0-9-]+(\.[a-zA-Z0-9-]+)+$/.test(onboardForm.domain.trim())) errors.domain = 'Enter a valid domain (e.g. acmecorp.com)'
+    return errors
+  }
+
+  async function handleOnboardSubmit() {
+    const errors = validateOnboardForm()
+    setOnboardErrors(errors)
+    if (Object.keys(errors).length > 0) return
+
+    setOnboardPending(true)
+    setOnboardError(null)
+    const result = await onboardClient({
+      companyName: onboardForm.companyName.trim(),
+      adminEmail: onboardForm.adminEmail.trim(),
+      domain: onboardForm.domain.trim(),
+      plan: onboardForm.plan,
+    })
+    setOnboardPending(false)
+    if (result?.error) {
+      setOnboardError(result.error)
+      return
+    }
+    setOnboardInviteLink(result.inviteLink ?? null)
+  }
+
+  async function copyInviteLink() {
+    if (!onboardInviteLink) return
+    await navigator.clipboard.writeText(onboardInviteLink)
+    setLinkCopied(true)
+    setTimeout(() => setLinkCopied(false), 2000)
   }
 
   function openBulkConfirm(key: string) {
@@ -229,7 +289,7 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
           </p>
         </div>
         <button
-          onClick={() => setShowOnboardModal(true)}
+          onClick={openOnboardModal}
           className="flex items-center gap-2 bg-violet-600 hover:bg-violet-500 text-white text-[13px] font-medium px-4 py-2 rounded-lg transition-colors"
         >
           <Plus className="w-4 h-4" />
@@ -450,35 +510,94 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
 
       {/* Onboard modal */}
       {showOnboardModal && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowOnboardModal(false)}>
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={closeOnboardModal}>
           <div className="bg-[#111118] border border-white/[0.1] rounded-2xl p-6 w-full max-w-md" onClick={e => e.stopPropagation()}>
-            <h2 className="text-[16px] font-semibold text-white mb-1">Onboard New Client</h2>
-            <p className="text-[12px] text-white/40 mb-5">Create a new organization and send invite to the admin.</p>
-            <div className="space-y-3">
-              {[
-                { label: 'Company Name', placeholder: 'Acme Corp' },
-                { label: 'Admin Email', placeholder: 'admin@acmecorp.com' },
-                { label: 'Domain', placeholder: 'acmecorp.com' },
-              ].map(f => (
-                <div key={f.label}>
-                  <label className="text-[11px] font-medium text-white/50 block mb-1">{f.label}</label>
-                  <input className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50" placeholder={f.placeholder} />
+            {!onboardInviteLink ? (
+              <>
+                <h2 className="text-[16px] font-semibold text-white mb-1">Onboard New Client</h2>
+                <p className="text-[12px] text-white/40 mb-5">Create a new organization and generate an admin invite link.</p>
+                <div className="space-y-3">
+                  <div>
+                    <label className="text-[11px] font-medium text-white/50 block mb-1">Company Name</label>
+                    <input
+                      value={onboardForm.companyName}
+                      onChange={e => setOnboardForm({ ...onboardForm, companyName: e.target.value })}
+                      disabled={onboardPending}
+                      className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50"
+                      placeholder="Acme Corp"
+                    />
+                    {onboardErrors.companyName && <p className="text-[11px] text-red-400 mt-1">{onboardErrors.companyName}</p>}
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-medium text-white/50 block mb-1">Admin Email</label>
+                    <input
+                      value={onboardForm.adminEmail}
+                      onChange={e => setOnboardForm({ ...onboardForm, adminEmail: e.target.value })}
+                      disabled={onboardPending}
+                      className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50"
+                      placeholder="admin@acmecorp.com"
+                    />
+                    {onboardErrors.adminEmail && <p className="text-[11px] text-red-400 mt-1">{onboardErrors.adminEmail}</p>}
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-medium text-white/50 block mb-1">Domain</label>
+                    <input
+                      value={onboardForm.domain}
+                      onChange={e => setOnboardForm({ ...onboardForm, domain: e.target.value })}
+                      disabled={onboardPending}
+                      className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50"
+                      placeholder="acmecorp.com"
+                    />
+                    {onboardErrors.domain && <p className="text-[11px] text-red-400 mt-1">{onboardErrors.domain}</p>}
+                  </div>
+                  <div>
+                    <label className="text-[11px] font-medium text-white/50 block mb-1">Plan</label>
+                    <select
+                      value={onboardForm.plan}
+                      onChange={e => setOnboardForm({ ...onboardForm, plan: e.target.value })}
+                      disabled={onboardPending}
+                      className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none"
+                    >
+                      <option>Starter</option>
+                      <option>Growth</option>
+                      <option>Pro</option>
+                      <option>Enterprise</option>
+                    </select>
+                  </div>
                 </div>
-              ))}
-              <div>
-                <label className="text-[11px] font-medium text-white/50 block mb-1">Plan</label>
-                <select className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none">
-                  <option>Starter</option>
-                  <option>Growth</option>
-                  <option>Pro</option>
-                  <option>Enterprise</option>
-                </select>
-              </div>
-            </div>
-            <div className="flex gap-2 mt-5">
-              <button onClick={() => setShowOnboardModal(false)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
-              <button className="flex-1 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors">Create & Send Invite</button>
-            </div>
+
+                {onboardError && <p className="text-[12px] text-red-400 mt-4">{onboardError}</p>}
+
+                <div className="flex gap-2 mt-5">
+                  <button disabled={onboardPending} onClick={closeOnboardModal} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors disabled:opacity-40">Cancel</button>
+                  <button disabled={onboardPending} onClick={handleOnboardSubmit} className="flex-1 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors disabled:opacity-50">
+                    {onboardPending ? 'Creating…' : 'Create Client'}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h2 className="text-[16px] font-semibold text-white mb-1">Client Created</h2>
+                <p className="text-[12px] text-white/40 mb-4">
+                  Share this invite link with {onboardForm.adminEmail} — no email has been sent automatically.
+                </p>
+                <div className="flex items-center gap-2 mb-2">
+                  <input
+                    readOnly
+                    value={onboardInviteLink}
+                    onFocus={e => e.target.select()}
+                    className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[12px] text-white/70 outline-none"
+                  />
+                  <button
+                    onClick={copyInviteLink}
+                    className="shrink-0 py-2 px-3 rounded-lg border border-white/[0.1] text-[12px] text-white/70 hover:text-white hover:bg-white/[0.06] transition-colors"
+                  >
+                    {linkCopied ? 'Copied!' : 'Copy Link'}
+                  </button>
+                </div>
+                <button onClick={closeOnboardModal} className="w-full mt-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors">Done</button>
+              </>
+            )}
           </div>
         </div>
       )}
