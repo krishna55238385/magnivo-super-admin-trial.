@@ -130,13 +130,17 @@ export async function getClientDetail(orgId: string) {
 
   const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
 
-  const [orgRes, usersRes, invoicesRes, usageRes] = await Promise.all([
+  const [orgRes, usersRes, invoicesRes, usageRes, subRes] = await Promise.all([
     safeQuery(`SELECT * FROM public.organizations WHERE id = $1`, [orgId]),
     safeQuery(`SELECT id, full_name, role, created_at FROM public.users WHERE organization_id = $1`, [orgId]),
     safeQuery(`SELECT * FROM public.invoices WHERE organization_id = $1 ORDER BY issued_at DESC LIMIT 10`, [orgId]),
     safeQuery(
       `SELECT model, feature, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE organization_id = $1 AND date >= $2`,
       [orgId, since]
+    ),
+    safeQuery(
+      `SELECT status, plan_name FROM public.client_subscriptions WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [orgId]
     ),
   ])
 
@@ -145,6 +149,8 @@ export async function getClientDetail(orgId: string) {
     users: usersRes.rows,
     invoices: invoicesRes.rows,
     usageSummary: usageRes.rows,
+    status: subRes.rows[0]?.status || 'trial',
+    plan: subRes.rows[0]?.plan_name || 'Starter',
   }
 }
 
@@ -257,9 +263,15 @@ export async function onboardClient(data: {
   )
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['client.onboarded', 'client', org.id, data.companyName, `Onboarded ${data.companyName} on ${data.plan} plan`, 'low']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'client.onboarded',
+      'client',
+      data.companyName,
+      JSON.stringify({ message: `Onboarded ${data.companyName} on ${data.plan} plan`, organization_id: org.id }),
+      'low',
+    ]
   )
 
   revalidatePath('/super-admin/clients')
@@ -271,14 +283,18 @@ export async function suspendClient(orgId: string, reason: string) {
   const auth = await requireSuperAdmin('all')
   if (!auth.ok) return { error: auth.error }
 
-  await pool.query(`UPDATE public.client_subscriptions SET status = 'suspended' WHERE organization_id = $1`, [orgId])
+  const updateRes = await pool.query(`UPDATE public.client_subscriptions SET status = 'suspended' WHERE organization_id = $1`, [orgId])
+  if (updateRes.rowCount === 0) {
+    return { error: 'No subscription record found for this organization' }
+  }
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, details, severity) VALUES ($1, $2, $3, $4, $5)`,
-    ['client.suspended', 'client', orgId, reason, 'high']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['client.suspended', 'client', orgId, JSON.stringify({ message: reason }), 'high']
   )
 
   revalidatePath('/super-admin/clients')
+  revalidatePath(`/super-admin/clients/${orgId}`)
   return { success: true }
 }
 
@@ -290,14 +306,26 @@ export async function changeClientPlan(orgId: string, newPlan: string) {
   const plan = planRows[0]
   if (!plan) return { error: 'Plan not found' }
 
-  await pool.query(
-    `UPDATE public.client_subscriptions SET plan_name = $1, plan_id = $2, token_limit = $3, mrr_cents = $4 WHERE organization_id = $5`,
-    [newPlan, plan.id, plan.token_limit, plan.monthly_price_cents, orgId]
+  const updateRes = await pool.query(
+    `UPDATE public.client_subscriptions SET plan_name = $1, mrr_cents = $2, updated_at = now() WHERE organization_id = $3`,
+    [newPlan, plan.monthly_price_cents, orgId]
   )
+  if (updateRes.rowCount === 0) {
+    return { error: 'No subscription record found for this organization' }
+  }
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['client.plan_changed', 'client', orgId, `→ ${newPlan}`, `Plan changed to ${newPlan}, $${(plan.monthly_price_cents / 100).toFixed(0)}/mo`, 'medium']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'client.plan_changed',
+      'client',
+      `→ ${newPlan}`,
+      JSON.stringify({
+        message: `Plan changed to ${newPlan}, $${(plan.monthly_price_cents / 100).toFixed(0)}/mo`,
+        organization_id: orgId,
+      }),
+      'medium',
+    ]
   )
 
   revalidatePath('/super-admin/clients')
@@ -356,8 +384,14 @@ export async function updateDocumentStatus(orgId: string, field: string, status:
   )
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['onboarding.document_updated', 'client', orgId, field, `${field} set to ${status}`, 'low']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'onboarding.document_updated',
+      'client',
+      field,
+      JSON.stringify({ message: `${field} set to ${status}`, organization_id: orgId }),
+      'low',
+    ]
   )
 
   revalidatePath('/super-admin/onboarding')
@@ -387,12 +421,24 @@ export async function activateClient(orgId: string) {
     return { error: 'All onboarding documents must be complete before activating' }
   }
 
+  // NOTE: these two UPDATEs are not wrapped in a transaction — if the client_subscriptions
+  // update below fails/no-ops, onboarding_tracker.activated_at has already committed, leaving
+  // a partial state. Follow-up: wrap in a transaction (tracked separately, not fixed here).
   await pool.query(`UPDATE public.onboarding_tracker SET activated_at = now() WHERE organization_id = $1`, [orgId])
-  await pool.query(`UPDATE public.client_subscriptions SET status = 'active' WHERE organization_id = $1`, [orgId])
+  const updateRes = await pool.query(`UPDATE public.client_subscriptions SET status = 'active' WHERE organization_id = $1`, [orgId])
+  if (updateRes.rowCount === 0) {
+    return { error: 'No subscription record found for this organization' }
+  }
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, details, severity) VALUES ($1, $2, $3, $4, $5)`,
-    ['client.activated', 'client', orgId, 'Client activated after all onboarding documents completed', 'medium']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'client.activated',
+      'client',
+      orgId,
+      JSON.stringify({ message: 'Client activated after all onboarding documents completed' }),
+      'medium',
+    ]
   )
 
   revalidatePath('/super-admin/onboarding')
@@ -446,8 +492,17 @@ export async function issueInvoice(data: {
   }
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['invoice.issued', 'billing', invoice.id, invoiceNum, `Manual invoice issued for $${(data.amountCents / 100).toFixed(2)}`, 'low']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'invoice.issued',
+      'billing',
+      invoiceNum,
+      JSON.stringify({
+        message: `Manual invoice issued for $${(data.amountCents / 100).toFixed(2)}`,
+        invoice_id: invoice.id,
+      }),
+      'low',
+    ]
   )
 
   revalidatePath('/super-admin/billing')
@@ -523,8 +578,8 @@ export async function updateInvoiceStatus(invoiceId: string, status: string) {
   )
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['invoice.status_updated', 'billing', invoiceId, status, `Invoice status set to ${status}`, 'low']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['invoice.status_updated', 'billing', invoiceId, JSON.stringify({ message: `Invoice status set to ${status}` }), 'low']
   )
 
   revalidatePath('/super-admin/billing')
@@ -715,7 +770,7 @@ export async function resolveTicket(ticketId: string) {
   )
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, severity) VALUES ($1, $2, $3, $4)`,
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, severity) VALUES ($1, $2, $3, $4)`,
     ['ticket.resolved', 'support', ticketId, 'low']
   )
 
@@ -762,7 +817,7 @@ export async function getPlatformAuditLogs(filters: {
   }
   if (filters.targetType && filters.targetType !== 'all') {
     params.push(filters.targetType)
-    conditions.push(`target_type = $${params.length}`)
+    conditions.push(`entity_type = $${params.length}`)
   }
 
   let sql = `SELECT * FROM public.super_admin_audit_logs`
@@ -808,8 +863,14 @@ export async function inviteTeamMember(data: {
   }
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['team.member_invited', 'team', member.id, `${data.fullName} (${data.role})`, `Invited ${data.email} as ${data.role}`, 'low']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'team.member_invited',
+      'team',
+      `${data.fullName} (${data.role})`,
+      JSON.stringify({ message: `Invited ${data.email} as ${data.role}`, member_id: member.id }),
+      'low',
+    ]
   )
 
   revalidatePath('/super-admin/team')
@@ -1054,8 +1115,8 @@ export async function updatePlatformSetting(key: string, value: string) {
   )
 
   await pool.query(
-    `INSERT INTO public.super_admin_audit_logs (action, target_type, target_id, target_label, details, severity) VALUES ($1, $2, $3, $4, $5, $6)`,
-    ['settings.updated', 'settings', key, key, `Updated ${key} to ${value}`, 'medium']
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['settings.updated', 'settings', key, JSON.stringify({ message: `Updated ${key} to ${value}` }), 'medium']
   )
 
   revalidatePath('/super-admin/settings')

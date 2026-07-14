@@ -88,10 +88,10 @@ export default async function SuperAdminDashboard() {
 
   const recentActivity = recentActivityRaw.map((a: any) => {
     const { icon, color } = SEVERITY_ICON[a.severity as string] || SEVERITY_ICON.low
-    const details = typeof a.details === 'string' ? a.details : (a.details ? JSON.stringify(a.details) : null)
-    const action = typeof a.action === 'string' ? a.action : JSON.stringify(a.action)
+    const message = a.details && typeof a.details === 'object' ? (a.details as any).message : null
+    const eventCode = typeof a.event_code === 'string' ? a.event_code : JSON.stringify(a.event_code)
     return {
-      label: a.target_label ? `${details || action} — ${a.target_label}` : (details || action),
+      label: a.entity_name ? `${message || eventCode} — ${a.entity_name}` : (message || eventCode),
       time: timeAgo(a.created_at),
       icon,
       color,

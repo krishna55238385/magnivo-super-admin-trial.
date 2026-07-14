@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import {
   ArrowLeft, Users, CreditCard, Zap, Settings,
   AlertCircle, ExternalLink, Shield,
@@ -9,6 +9,7 @@ import {
   LifeBuoy, BarChart2, MessageSquare, Send, Clock, Lock, X, Activity
 } from 'lucide-react'
 import Link from 'next/link'
+import { suspendClient, changeClientPlan } from '@/app/actions/super-admin'
 
 type Org = { id: string; name: string; created_at: string; timezone?: string | null; currency?: string | null; logo_url?: string | null }
 type User = { id: string; full_name: string | null; role: string | null; email?: string | null; is_active?: boolean | null; created_at?: string }
@@ -37,6 +38,14 @@ const invoiceStatusColor: Record<string, string> = {
   void: 'bg-white/[0.06] text-white/40 border-white/[0.1]',
 }
 
+const statusBadgeColor: Record<string, string> = {
+  active: 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20',
+  trial: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+  suspended: 'bg-red-500/10 text-red-400 border-red-500/20',
+}
+
+const PLAN_OPTIONS = ['Starter', 'Growth', 'Pro', 'Enterprise']
+
 const ticketStatusColor: Record<string, string> = {
   open: 'bg-red-500/10 text-red-400 border-red-500/20',
   in_progress: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
@@ -48,12 +57,14 @@ const ticketStatusColor: Record<string, string> = {
 const OPEN_TICKET_STATUSES = new Set(['open', 'in_progress', 'waiting'])
 
 export default function ClientDetailView({
-  org, users, invoices, usageSummary, tickets, auditLogs, notes: initialNotes,
+  org, users, invoices, usageSummary, status, plan, tickets, auditLogs, notes: initialNotes,
 }: {
   org: Org
   users: User[]
   invoices: Invoice[]
   usageSummary: UsageRow[]
+  status: string
+  plan: string
   tickets: Ticket[]
   auditLogs: AuditLog[]
   notes: string | null
@@ -63,10 +74,73 @@ export default function ClientDetailView({
   const [showImpersonateModal, setShowImpersonateModal] = useState(false)
   const [showDangerConfirm, setShowDangerConfirm] = useState<string | null>(null)
   const [dangerInput, setDangerInput] = useState('')
+  const [dangerReason, setDangerReason] = useState('')
+  const [dangerPending, setDangerPending] = useState(false)
+  const [dangerError, setDangerError] = useState<string | null>(null)
+  const [clientStatus, setClientStatus] = useState(status)
+  const [clientPlan, setClientPlan] = useState(plan)
+  const [showPlanModal, setShowPlanModal] = useState(false)
+  const [selectedPlan, setSelectedPlan] = useState(plan)
+  const [planPending, setPlanPending] = useState(false)
+  const [planError, setPlanError] = useState<string | null>(null)
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   const dangerActions: Record<string, { label: string; confirmWord: string; color: string }> = {
     suspend: { label: 'Suspend Organization', confirmWord: 'SUSPEND', color: 'amber' },
     delete: { label: 'Delete Organization', confirmWord: 'DELETE', color: 'red' },
+  }
+
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 4000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  function openDangerConfirm(action: string) {
+    setShowDangerConfirm(action)
+    setDangerInput('')
+    setDangerReason('')
+    setDangerError(null)
+  }
+
+  async function handleDangerConfirm() {
+    if (!showDangerConfirm) return
+    if (showDangerConfirm !== 'suspend') {
+      setDangerError('This action is not implemented yet.')
+      return
+    }
+    setDangerPending(true)
+    setDangerError(null)
+    const result = await suspendClient(org.id, dangerReason.trim() || 'Suspended via admin dashboard')
+    setDangerPending(false)
+    if (result?.error) {
+      setDangerError(result.error)
+      return
+    }
+    setClientStatus('suspended')
+    setShowDangerConfirm(null)
+    setToast({ type: 'success', text: `${org.name} has been suspended.` })
+  }
+
+  function openPlanModal() {
+    setSelectedPlan(clientPlan)
+    setPlanError(null)
+    setShowPlanModal(true)
+  }
+
+  async function handlePlanConfirm() {
+    if (selectedPlan === clientPlan) return
+    setPlanPending(true)
+    setPlanError(null)
+    const result = await changeClientPlan(org.id, selectedPlan)
+    setPlanPending(false)
+    if (result?.error) {
+      setPlanError(result.error)
+      return
+    }
+    setClientPlan(selectedPlan)
+    setShowPlanModal(false)
+    setToast({ type: 'success', text: `${org.name}'s plan changed to ${selectedPlan}.` })
   }
 
   const totalTokens30d = usageSummary.reduce((sum, r) => sum + (Number(r.total_tokens) || 0), 0)
@@ -86,7 +160,15 @@ export default function ClientDetailView({
               {org.name.charAt(0)}
             </div>
             <div>
-              <h1 className="text-xl font-semibold text-white">{org.name}</h1>
+              <div className="flex items-center gap-2">
+                <h1 className="text-xl font-semibold text-white">{org.name}</h1>
+                <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${statusBadgeColor[clientStatus] ?? statusBadgeColor.trial}`}>
+                  {clientStatus}
+                </span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full font-medium border bg-violet-500/10 text-violet-400 border-violet-500/20">
+                  {clientPlan}
+                </span>
+              </div>
               <p className="text-[12px] text-white/40 mt-0.5">Joined {formatDate(org.created_at)}{org.timezone ? ` · ${org.timezone}` : ''}{org.currency ? ` · ${org.currency}` : ''}</p>
             </div>
           </div>
@@ -94,16 +176,23 @@ export default function ClientDetailView({
 
         <div className="flex items-center gap-2">
           <button
+            onClick={openPlanModal}
+            className="flex items-center gap-1.5 bg-white/[0.05] border border-white/[0.08] text-white/60 text-[12px] px-3 py-2 rounded-lg hover:bg-white/[0.08] transition-colors"
+          >
+            <CreditCard className="w-3.5 h-3.5" /> Change Plan
+          </button>
+          <button
             onClick={() => setShowImpersonateModal(true)}
             className="flex items-center gap-1.5 bg-white/[0.05] border border-white/[0.08] text-white/60 text-[12px] px-3 py-2 rounded-lg hover:bg-white/[0.08] transition-colors"
           >
             <ExternalLink className="w-3.5 h-3.5" /> Impersonate
           </button>
           <button
-            onClick={() => { setShowDangerConfirm('suspend'); setDangerInput('') }}
-            className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[12px] px-3 py-2 rounded-lg hover:bg-amber-500/15 transition-colors"
+            onClick={() => openDangerConfirm('suspend')}
+            disabled={clientStatus === 'suspended'}
+            className="flex items-center gap-1.5 bg-amber-500/10 border border-amber-500/20 text-amber-400 text-[12px] px-3 py-2 rounded-lg hover:bg-amber-500/15 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
           >
-            <Ban className="w-3.5 h-3.5" /> Suspend
+            <Ban className="w-3.5 h-3.5" /> {clientStatus === 'suspended' ? 'Suspended' : 'Suspend'}
           </button>
         </div>
       </div>
@@ -436,13 +525,14 @@ export default function ClientDetailView({
             <p className="text-[12px] text-white/40 mb-4">These actions are irreversible. A typed confirmation is required.</p>
             <div className="space-y-2">
               <button
-                onClick={() => { setShowDangerConfirm('suspend'); setDangerInput('') }}
-                className="w-full py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[12px] text-amber-400 hover:bg-amber-500/15 transition-colors"
+                onClick={() => openDangerConfirm('suspend')}
+                disabled={clientStatus === 'suspended'}
+                className="w-full py-2 rounded-lg bg-amber-500/10 border border-amber-500/20 text-[12px] text-amber-400 hover:bg-amber-500/15 transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
               >
-                Suspend Organization
+                {clientStatus === 'suspended' ? 'Organization Suspended' : 'Suspend Organization'}
               </button>
               <button
-                onClick={() => { setShowDangerConfirm('delete'); setDangerInput('') }}
+                onClick={() => openDangerConfirm('delete')}
                 className="w-full py-2 rounded-lg bg-red-500/10 border border-red-500/20 text-[12px] text-red-400 hover:bg-red-500/15 transition-colors"
               >
                 Delete Organization
@@ -467,11 +557,11 @@ export default function ClientDetailView({
                   <Activity className="w-3.5 h-3.5 text-white/30 mt-0.5 flex-shrink-0" />
                   <div className="flex-1">
                     <p className="text-[12px] text-white/70">
-                      <span className="font-medium">{log.action ?? log.event_type ?? 'Event'}</span>
-                      {(log.actor_email ?? log.performed_by) && <span className="text-white/40"> — by {log.actor_email ?? log.performed_by}</span>}
+                      <span className="font-medium">{log.event_code ?? 'Event'}</span>
+                      {(log.actor_name ?? log.actor_email) && <span className="text-white/40"> — by {log.actor_name ?? log.actor_email}</span>}
                     </p>
-                    {(log.details ?? log.description) && (
-                      <p className="text-[11px] text-white/40 mt-0.5">{log.details ?? log.description}</p>
+                    {log.details?.message && (
+                      <p className="text-[11px] text-white/40 mt-0.5">{log.details.message}</p>
                     )}
                   </div>
                   <span className="text-[10px] text-white/25 whitespace-nowrap">{formatDateTime(log.created_at)}</span>
@@ -540,19 +630,76 @@ export default function ClientDetailView({
                 className={`w-full bg-white/[0.04] border rounded-lg px-3 py-2 text-[13px] text-white outline-none mb-4 ${isRed ? 'border-red-500/30 focus:border-red-500/60' : 'border-amber-500/30 focus:border-amber-500/60'}`}
                 placeholder={action.confirmWord}
               />
+              {showDangerConfirm === 'suspend' && (
+                <textarea
+                  value={dangerReason}
+                  onChange={e => setDangerReason(e.target.value)}
+                  rows={2}
+                  placeholder="Reason (optional) — recorded in the audit log"
+                  className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[12px] text-white/80 placeholder:text-white/25 outline-none mb-4 resize-none"
+                />
+              )}
+              {dangerError && <p className="text-[11px] text-red-400 mb-3">{dangerError}</p>}
               <div className="flex gap-2">
                 <button onClick={() => setShowDangerConfirm(null)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
                 <button
-                  disabled={dangerInput !== action.confirmWord}
+                  onClick={handleDangerConfirm}
+                  disabled={dangerInput !== action.confirmWord || dangerPending}
                   className={`flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed ${isRed ? 'bg-red-600 hover:bg-red-500' : 'bg-amber-600 hover:bg-amber-500'}`}
                 >
-                  Confirm
+                  {dangerPending ? 'Working…' : 'Confirm'}
                 </button>
               </div>
             </div>
           </div>
         )
       })()}
+
+      {/* Change Plan modal */}
+      {showPlanModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowPlanModal(false)}>
+          <div className="bg-[#111118] border border-white/[0.12] rounded-2xl p-6 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <h2 className="text-[15px] font-semibold text-white mb-1">Change Plan</h2>
+            <p className="text-[12px] text-white/40 mb-4">Select a new plan for {org.name}.</p>
+            <div className="space-y-2 mb-4">
+              {PLAN_OPTIONS.map(p => (
+                <button
+                  key={p}
+                  onClick={() => setSelectedPlan(p)}
+                  className={`w-full flex items-center justify-between px-3 py-2 rounded-lg border text-[13px] transition-colors ${
+                    selectedPlan === p
+                      ? 'border-violet-500/50 bg-violet-600/15 text-violet-300'
+                      : 'border-white/[0.08] text-white/60 hover:bg-white/[0.04]'
+                  }`}
+                >
+                  <span>{p}</span>
+                  {clientPlan === p && <span className="text-[10px] text-white/30">Current</span>}
+                </button>
+              ))}
+            </div>
+            {planError && <p className="text-[11px] text-red-400 mb-3">{planError}</p>}
+            <div className="flex gap-2">
+              <button onClick={() => setShowPlanModal(false)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+              <button
+                onClick={handlePlanConfirm}
+                disabled={selectedPlan === clientPlan || planPending}
+                className="flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed bg-violet-600 hover:bg-violet-500"
+              >
+                {planPending ? 'Working…' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Toast */}
+      {toast && (
+        <div className={`fixed bottom-5 right-5 z-50 px-4 py-3 rounded-lg border text-[12px] font-medium shadow-lg ${
+          toast.type === 'success' ? 'bg-emerald-950/90 border-emerald-500/30 text-emerald-300' : 'bg-red-950/90 border-red-500/30 text-red-300'
+        }`}>
+          {toast.text}
+        </div>
+      )}
     </div>
   )
 }
