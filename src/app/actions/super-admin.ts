@@ -26,6 +26,11 @@ export async function getRolePermissions() {
   return ROLE_PERMISSIONS
 }
 
+export async function getCurrentTeamUserId() {
+  const auth = await requireSuperAdmin()
+  return auth.ok ? auth.user.userId : null
+}
+
 // Require an internal team role, optionally scoped to a specific permission
 async function requireSuperAdmin(permission?: string) {
   const cookieStore = await cookies()
@@ -962,6 +967,62 @@ export async function acceptTeamInvite(data: { token: string; fullName: string; 
     path: '/',
     maxAge: 60 * 60 * 24 * 7,
   })
+
+  revalidatePath('/super-admin/team')
+  return { success: true }
+}
+
+export async function deactivateTeamMember(memberId: string) {
+  const auth = await requireSuperAdmin('all')
+  if (!auth.ok) return { error: auth.error }
+
+  if (auth.user.userId === memberId) {
+    return { error: 'You cannot deactivate your own account' }
+  }
+
+  const updateRes = await pool.query(
+    `UPDATE public.internal_team SET status = 'inactive' WHERE id = $1 RETURNING full_name, email, role`,
+    [memberId]
+  )
+  if (updateRes.rowCount === 0) return { error: 'Team member not found' }
+  const member = updateRes.rows[0]
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'team.member_deactivated',
+      'team',
+      `${member.full_name} (${member.role})`,
+      JSON.stringify({ message: `Deactivated ${member.email} by ${auth.user.email}` }),
+      'medium',
+    ]
+  )
+
+  revalidatePath('/super-admin/team')
+  return { success: true }
+}
+
+export async function reactivateTeamMember(memberId: string) {
+  const auth = await requireSuperAdmin('all')
+  if (!auth.ok) return { error: auth.error }
+
+  const updateRes = await pool.query(
+    `UPDATE public.internal_team SET status = 'active' WHERE id = $1 RETURNING full_name, email, role`,
+    [memberId]
+  )
+  if (updateRes.rowCount === 0) return { error: 'Team member not found' }
+  const member = updateRes.rows[0]
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'team.member_reactivated',
+      'team',
+      `${member.full_name} (${member.role})`,
+      JSON.stringify({ message: `Reactivated ${member.email} by ${auth.user.email}` }),
+      'medium',
+    ]
+  )
 
   revalidatePath('/super-admin/team')
   return { success: true }

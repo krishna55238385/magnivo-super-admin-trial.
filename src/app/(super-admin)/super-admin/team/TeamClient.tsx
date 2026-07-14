@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useTransition } from 'react'
-import { Plus, Shield, CheckCircle2, XCircle, Mail } from 'lucide-react'
-import { inviteTeamMember } from '@/app/actions/super-admin'
+import { useState, useTransition, useEffect } from 'react'
+import { Plus, Shield, CheckCircle2, XCircle, Mail, Ban, RotateCcw } from 'lucide-react'
+import { inviteTeamMember, deactivateTeamMember, reactivateTeamMember } from '@/app/actions/super-admin'
 
 type TeamMember = {
   id: string
@@ -38,6 +38,13 @@ const PERMISSION_LABELS: Record<string, string> = {
 const STATUS_LABELS: Record<string, string> = {
   pending: 'Invited',
   active: 'Active',
+  inactive: 'Inactive',
+}
+
+const STATUS_STYLES: Record<string, string> = {
+  active: 'text-emerald-400 bg-emerald-400',
+  pending: 'text-amber-400 bg-amber-400',
+  inactive: 'text-red-400 bg-red-400',
 }
 
 function timeAgo(iso: string | null) {
@@ -52,15 +59,68 @@ function timeAgo(iso: string | null) {
   return `${days} day${days === 1 ? '' : 's'} ago`
 }
 
-export default function TeamClient({ team, rolePermissions }: { team: TeamMember[]; rolePermissions: RolePermissions }) {
+export default function TeamClient({ team: initialTeam, rolePermissions, currentUserId }: { team: TeamMember[]; rolePermissions: RolePermissions; currentUserId: string | null }) {
   const [tab, setTab] = useState<'members' | 'roles'>('members')
   const [showInvite, setShowInvite] = useState(false)
+  const [team, setTeam] = useState(initialTeam)
+  const [showDeactivateConfirm, setShowDeactivateConfirm] = useState<TeamMember | null>(null)
+  const [deactivateInput, setDeactivateInput] = useState('')
+  const [deactivatePending, setDeactivatePending] = useState(false)
+  const [deactivateError, setDeactivateError] = useState<string | null>(null)
+  const [reactivatingId, setReactivatingId] = useState<string | null>(null)
+  const [reactivateError, setReactivateError] = useState<string | null>(null)
+  const [toast, setToast] = useState<string | null>(null)
 
   const roleNames = Object.keys(rolePermissions)
   const invitableRoles = roleNames.filter(r => r !== 'super_admin')
 
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 4000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  function openDeactivateConfirm(member: TeamMember) {
+    setShowDeactivateConfirm(member)
+    setDeactivateInput('')
+    setDeactivateError(null)
+  }
+
+  async function handleDeactivateConfirm() {
+    if (!showDeactivateConfirm) return
+    setDeactivatePending(true)
+    setDeactivateError(null)
+    const result = await deactivateTeamMember(showDeactivateConfirm.id)
+    setDeactivatePending(false)
+    if (result?.error) {
+      setDeactivateError(result.error)
+      return
+    }
+    setTeam(prev => prev.map(m => m.id === showDeactivateConfirm.id ? { ...m, status: 'inactive' } : m))
+    setToast(`${showDeactivateConfirm.full_name} has been deactivated.`)
+    setShowDeactivateConfirm(null)
+  }
+
+  async function handleReactivate(member: TeamMember) {
+    setReactivatingId(member.id)
+    setReactivateError(null)
+    const result = await reactivateTeamMember(member.id)
+    setReactivatingId(null)
+    if (result?.error) {
+      setReactivateError(result.error)
+      return
+    }
+    setTeam(prev => prev.map(m => m.id === member.id ? { ...m, status: 'active' } : m))
+    setToast(`${member.full_name} has been reactivated.`)
+  }
+
   return (
     <div className="space-y-5 max-w-[1100px]">
+      {toast && (
+        <div className="fixed top-4 right-4 z-50 bg-[#111118] border border-white/[0.1] rounded-lg px-4 py-2.5 text-[12px] text-white/80 shadow-lg">
+          {toast}
+        </div>
+      )}
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -92,7 +152,7 @@ export default function TeamClient({ team, rolePermissions }: { team: TeamMember
             <table className="w-full">
               <thead>
                 <tr className="border-b border-white/[0.06]">
-                  {['Member', 'Role', 'Department', 'Status', 'Last Login'].map(h => (
+                  {['Member', 'Role', 'Department', 'Status', 'Last Login', ''].map(h => (
                     <th key={h} className="text-left text-[11px] font-medium text-white/30 px-5 py-3">{h}</th>
                   ))}
                 </tr>
@@ -101,6 +161,8 @@ export default function TeamClient({ team, rolePermissions }: { team: TeamMember
                 {team.map(m => {
                   const r = roleConfig[m.role] ?? { color: 'text-white/40 bg-white/[0.04] border-white/[0.1]', label: m.role, description: '' }
                   const status = STATUS_LABELS[m.status] ?? m.status
+                  const style = STATUS_STYLES[m.status] ?? STATUS_STYLES.pending
+                  const [textColor, dotColor] = style.split(' ')
                   return (
                     <tr key={m.id} className="border-b border-white/[0.04] hover:bg-white/[0.02] group">
                       <td className="px-5 py-3">
@@ -119,15 +181,36 @@ export default function TeamClient({ team, rolePermissions }: { team: TeamMember
                       </td>
                       <td className="px-5 py-3 text-[12px] text-white/50">{m.department ?? '—'}</td>
                       <td className="px-5 py-3">
-                        <div className={`inline-flex items-center gap-1.5 text-[11px] ${m.status === 'active' ? 'text-emerald-400' : 'text-amber-400'}`}>
-                          <div className={`w-1.5 h-1.5 rounded-full ${m.status === 'active' ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+                        <div className={`inline-flex items-center gap-1.5 text-[11px] ${textColor}`}>
+                          <div className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
                           {status}
                         </div>
                       </td>
                       <td className="px-5 py-3 text-[11px] text-white/30">{timeAgo(m.last_login_at)}</td>
+                      <td className="px-5 py-3 text-right">
+                        {m.status === 'inactive' ? (
+                          <button
+                            onClick={() => handleReactivate(m)}
+                            disabled={reactivatingId === m.id}
+                            className="inline-flex items-center gap-1.5 text-[11px] text-white/50 hover:text-white disabled:opacity-40 transition-colors"
+                          >
+                            <RotateCcw className="w-3.5 h-3.5" /> {reactivatingId === m.id ? 'Reactivating…' : 'Reactivate'}
+                          </button>
+                        ) : m.id !== currentUserId ? (
+                          <button
+                            onClick={() => openDeactivateConfirm(m)}
+                            className="inline-flex items-center gap-1.5 text-[11px] text-white/30 hover:text-red-400 transition-colors opacity-0 group-hover:opacity-100"
+                          >
+                            <Ban className="w-3.5 h-3.5" /> Deactivate
+                          </button>
+                        ) : null}
+                      </td>
                     </tr>
                   )
                 })}
+                {reactivateError && (
+                  <tr><td colSpan={6} className="px-5 py-2 text-[11px] text-red-400">{reactivateError}</td></tr>
+                )}
               </tbody>
             </table>
           )}
@@ -176,6 +259,35 @@ export default function TeamClient({ team, rolePermissions }: { team: TeamMember
 
       {/* Invite modal */}
       {showInvite && <InviteModal invitableRoles={invitableRoles} onClose={() => setShowInvite(false)} />}
+
+      {/* Deactivate confirm modal */}
+      {showDeactivateConfirm && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowDeactivateConfirm(null)}>
+          <div className="bg-[#111118] border border-white/[0.12] rounded-2xl p-6 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <h2 className="text-[15px] font-semibold text-red-400 mb-2">Deactivate {showDeactivateConfirm.full_name}</h2>
+            <p className="text-[12px] text-white/40 mb-4">
+              Type <span className="font-mono font-bold text-red-400">DEACTIVATE</span> to confirm. They will immediately lose access to the super admin panel.
+            </p>
+            <input
+              value={deactivateInput}
+              onChange={e => setDeactivateInput(e.target.value)}
+              className="w-full bg-white/[0.04] border border-red-500/30 focus:border-red-500/60 rounded-lg px-3 py-2 text-[13px] text-white outline-none mb-4"
+              placeholder="DEACTIVATE"
+            />
+            {deactivateError && <p className="text-[11px] text-red-400 mb-3">{deactivateError}</p>}
+            <div className="flex gap-2">
+              <button onClick={() => setShowDeactivateConfirm(null)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+              <button
+                onClick={handleDeactivateConfirm}
+                disabled={deactivateInput !== 'DEACTIVATE' || deactivatePending}
+                className="flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed bg-red-600 hover:bg-red-500"
+              >
+                {deactivatePending ? 'Working…' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

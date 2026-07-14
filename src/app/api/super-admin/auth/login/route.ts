@@ -15,13 +15,17 @@ export async function POST(req: NextRequest) {
     }
 
     const { rows } = await pool.query(
-      `SELECT id, email, password_hash, role, full_name FROM public.internal_team WHERE email = $1`,
+      `SELECT id, email, password_hash, role, full_name, status FROM public.internal_team WHERE email = $1`,
       [email]
     )
     const user = rows[0]
 
     if (!user || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
+    }
+
+    if (user.status !== 'active') {
+      return NextResponse.json({ error: 'This account has been deactivated' }, { status: 403 })
     }
 
     await pool.query(`UPDATE public.internal_team SET last_login_at = now() WHERE id = $1`, [user.id])

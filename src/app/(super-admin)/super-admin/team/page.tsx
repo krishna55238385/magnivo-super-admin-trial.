@@ -1,10 +1,11 @@
-import { getTeamMembers, getRolePermissions } from '@/app/actions/super-admin'
+import { getTeamMembers, getRolePermissions, getCurrentTeamUserId } from '@/app/actions/super-admin'
 import TeamClient from './TeamClient'
 
 export default async function TeamPage() {
-  const [members, rolePermissions] = await Promise.all([
+  const [members, rolePermissions, currentUserId] = await Promise.all([
     getTeamMembers(),
     getRolePermissions(),
+    getCurrentTeamUserId(),
   ])
 
   // Never forward raw DB rows (e.g. password_hash) to the client bundle
@@ -19,5 +20,5 @@ export default async function TeamPage() {
     created_at: m.created_at,
   }))
 
-  return <TeamClient team={team} rolePermissions={rolePermissions} />
+  return <TeamClient team={team} rolePermissions={rolePermissions} currentUserId={currentUserId} />
 }
