@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
 import {
   ArrowLeft, Users, CreditCard, Zap, Settings,
   AlertCircle, ExternalLink, Shield,
@@ -10,6 +11,7 @@ import {
 } from 'lucide-react'
 import Link from 'next/link'
 import { suspendClient, changeClientPlan, updateClientNotes } from '@/app/actions/super-admin'
+import IssueInvoiceModal, { InvoicePlanOption } from '@/components/super-admin/IssueInvoiceModal'
 
 type Org = { id: string; name: string; created_at: string; timezone?: string | null; currency?: string | null; logo_url?: string | null }
 type User = { id: string; full_name: string | null; role: string | null; email?: string | null; is_active?: boolean | null; created_at?: string }
@@ -57,7 +59,7 @@ const ticketStatusColor: Record<string, string> = {
 const OPEN_TICKET_STATUSES = new Set(['open', 'in_progress', 'waiting'])
 
 export default function ClientDetailView({
-  org, users, invoices, usageSummary, status, plan, tickets, auditLogs, notes: initialNotes,
+  org, users, invoices, usageSummary, status, plan, tickets, auditLogs, notes: initialNotes, plans,
 }: {
   org: Org
   users: User[]
@@ -68,8 +70,11 @@ export default function ClientDetailView({
   tickets: Ticket[]
   auditLogs: AuditLog[]
   notes: string | null
+  plans: InvoicePlanOption[]
 }) {
+  const router = useRouter()
   const [tab, setTab] = useState('Overview')
+  const [showIssueModal, setShowIssueModal] = useState(false)
   const [notes, setNotes] = useState(initialNotes ?? '')
   const [showImpersonateModal, setShowImpersonateModal] = useState(false)
   const [showDangerConfirm, setShowDangerConfirm] = useState<string | null>(null)
@@ -155,6 +160,12 @@ export default function ClientDetailView({
       return
     }
     setToast({ type: 'success', text: 'Notes saved.' })
+  }
+
+  function handleInvoiceSuccess(message: string) {
+    setShowIssueModal(false)
+    router.refresh()
+    setToast({ type: 'success', text: message })
   }
 
   const totalTokens30d = usageSummary.reduce((sum, r) => sum + (Number(r.total_tokens) || 0), 0)
@@ -376,7 +387,10 @@ export default function ClientDetailView({
         <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-5">
           <div className="flex items-center justify-between mb-4">
             <p className="text-[13px] font-semibold text-white">Invoice History</p>
-            <button className="text-[12px] text-violet-400 hover:text-violet-300 flex items-center gap-1">
+            <button
+              onClick={() => setShowIssueModal(true)}
+              className="text-[12px] text-violet-400 hover:text-violet-300 flex items-center gap-1"
+            >
               <Plus className="w-3.5 h-3.5" /> Issue Invoice
             </button>
           </div>
@@ -705,6 +719,17 @@ export default function ClientDetailView({
             </div>
           </div>
         </div>
+      )}
+
+      {showIssueModal && (
+        <IssueInvoiceModal
+          onClose={() => setShowIssueModal(false)}
+          onSuccess={handleInvoiceSuccess}
+          plans={plans}
+          fixedOrgId={org.id}
+          fixedOrgName={org.name}
+          defaultPlanName={clientPlan}
+        />
       )}
 
       {/* Toast */}

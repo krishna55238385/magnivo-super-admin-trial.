@@ -1,11 +1,13 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
+import { useRouter } from 'next/navigation'
 import {
   DollarSign, TrendingUp, CreditCard, AlertCircle, Plus,
   FileText, Download, CheckCircle2, XCircle, Clock, Ban,
 } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
+import IssueInvoiceModal from '@/components/super-admin/IssueInvoiceModal'
 
 type Invoice = {
   id: string
@@ -14,7 +16,7 @@ type Invoice = {
   status: string
   issued_at: string
   paid_at: string | null
-  due_at: string | null
+  due_date: string | null
   organization_name: string | null
   organizations?: { name: string | null }
 }
@@ -96,18 +98,37 @@ function normalizeFeatures(features: Plan['features']): string[] {
   return [String(parsed)]
 }
 
+type ClientOption = { id: string; name: string; plan_name?: string | null }
+
 export default function BillingClient({
   invoices,
   revenueStats,
   mrrBreakdown,
   plans,
+  clients,
 }: {
   invoices: Invoice[]
   revenueStats: RevenueStats
   mrrBreakdown: MRRRow[]
   plans: Plan[]
+  clients: ClientOption[]
 }) {
+  const router = useRouter()
   const [activeTab, setActiveTab] = useState<'invoices' | 'plans' | 'revenue'>('invoices')
+  const [showIssueModal, setShowIssueModal] = useState(false)
+  const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
+
+  useEffect(() => {
+    if (!toast) return
+    const t = setTimeout(() => setToast(null), 4000)
+    return () => clearTimeout(t)
+  }, [toast])
+
+  function handleInvoiceSuccess(message: string) {
+    setShowIssueModal(false)
+    router.refresh()
+    setToast({ type: 'success', text: message })
+  }
 
   const totalMRR = revenueStats.total_mrr_cents
   const totalARR = revenueStats.total_arr_cents
@@ -132,7 +153,10 @@ export default function BillingClient({
           <h1 className="text-xl font-semibold text-white">Billing & Revenue</h1>
           <p className="text-[13px] text-white/40 mt-0.5">Manage invoices, plans, and revenue tracking</p>
         </div>
-        <button className="flex items-center gap-2 bg-violet-600 hover:bg-violet-500 text-white text-[13px] font-medium px-4 py-2 rounded-lg transition-colors">
+        <button
+          onClick={() => setShowIssueModal(true)}
+          className="flex items-center gap-2 bg-violet-600 hover:bg-violet-500 text-white text-[13px] font-medium px-4 py-2 rounded-lg transition-colors"
+        >
           <Plus className="w-4 h-4" /> Issue Invoice
         </button>
       </div>
@@ -208,7 +232,7 @@ export default function BillingClient({
                     <td className="px-5 py-3 text-[12px] text-white/70">{clientName}</td>
                     <td className="px-5 py-3 text-[13px] font-semibold text-white">{fmtMoney(inv.amount_cents)}</td>
                     <td className="px-5 py-3 text-[12px] text-white/40">{fmtDate(inv.issued_at)}</td>
-                    <td className="px-5 py-3 text-[12px] text-white/40">{fmtDate(inv.due_at)}</td>
+                    <td className="px-5 py-3 text-[12px] text-white/40">{fmtDate(inv.due_date)}</td>
                     <td className="px-5 py-3">
                       <div className={`inline-flex items-center gap-1.5 text-[11px] font-medium px-2 py-0.5 rounded-full border ${s.color}`}>
                         <Icon className="w-3 h-3" />
@@ -220,7 +244,13 @@ export default function BillingClient({
                         <button className="text-[11px] text-white/40 hover:text-white/70 px-2 py-1 rounded border border-white/[0.06]">View</button>
                         <button className="text-[11px] text-white/40 hover:text-white/70 px-2 py-1 rounded border border-white/[0.06]">Download</button>
                         {inv.status !== 'paid' && (
-                          <button className="text-[11px] text-violet-400 hover:text-violet-300 px-2 py-1 rounded border border-violet-500/20">Retry</button>
+                          <button
+                            disabled
+                            title="Not implemented yet"
+                            className="text-[11px] text-violet-400/40 cursor-not-allowed px-2 py-1 rounded border border-violet-500/10"
+                          >
+                            Retry
+                          </button>
                         )}
                       </div>
                     </td>
@@ -328,6 +358,23 @@ export default function BillingClient({
               </tbody>
             </table>
           </div>
+        </div>
+      )}
+
+      {showIssueModal && (
+        <IssueInvoiceModal
+          onClose={() => setShowIssueModal(false)}
+          onSuccess={handleInvoiceSuccess}
+          clients={clients}
+          plans={plans}
+        />
+      )}
+
+      {toast && (
+        <div className={`fixed bottom-6 right-6 z-50 px-4 py-3 rounded-lg text-[13px] font-medium shadow-xl ${
+          toast.type === 'success' ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white'
+        }`}>
+          {toast.text}
         </div>
       )}
     </div>

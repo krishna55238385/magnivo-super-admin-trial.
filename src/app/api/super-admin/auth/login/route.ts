@@ -20,12 +20,8 @@ export async function POST(req: NextRequest) {
     )
     const user = rows[0]
 
-    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
+    if (!user || !user.password_hash || !(await bcrypt.compare(password, user.password_hash))) {
       return NextResponse.json({ error: 'Invalid email or password' }, { status: 401 })
-    }
-
-    if (user.role !== 'super_admin') {
-      return NextResponse.json({ error: 'Super admin access required' }, { status: 403 })
     }
 
     const token = jwt.sign(

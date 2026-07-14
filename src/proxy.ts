@@ -10,6 +10,7 @@ const PUBLIC_ROUTES = [
   '/api/engage/worker',
   '/api/super-admin/auth/',
   '/landing',
+  '/team/accept/',
 ]
 
 function isPublicRoute(pathname: string) {

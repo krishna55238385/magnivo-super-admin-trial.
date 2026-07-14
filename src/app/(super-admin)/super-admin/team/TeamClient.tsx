@@ -181,6 +181,8 @@ function InviteModal({ invitableRoles, onClose }: { invitableRoles: string[]; on
   const [department, setDepartment] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [isPending, startTransition] = useTransition()
+  const [inviteLink, setInviteLink] = useState<string | null>(null)
+  const [linkCopied, setLinkCopied] = useState(false)
 
   function handleSubmit() {
     if (!fullName.trim() || !email.trim()) {
@@ -194,44 +196,77 @@ function InviteModal({ invitableRoles, onClose }: { invitableRoles: string[]; on
         setError(result.error)
         return
       }
-      onClose()
+      setInviteLink(result.inviteLink ?? null)
     })
+  }
+
+  async function copyInviteLink() {
+    if (!inviteLink) return
+    await navigator.clipboard.writeText(inviteLink)
+    setLinkCopied(true)
+    setTimeout(() => setLinkCopied(false), 2000)
   }
 
   return (
     <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={onClose}>
       <div className="bg-[#111118] border border-white/[0.1] rounded-2xl p-6 w-full max-w-md" onClick={e => e.stopPropagation()}>
-        <h2 className="text-[16px] font-semibold text-white mb-1">Invite Team Member</h2>
-        <p className="text-[12px] text-white/40 mb-5">Send an invite to a Magnavo AI team member.</p>
-        <div className="space-y-3">
-          <div>
-            <label className="text-[11px] font-medium text-white/50 block mb-1">Full Name</label>
-            <input value={fullName} onChange={e => setFullName(e.target.value)} className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50" placeholder="Jane Smith" />
-          </div>
-          <div>
-            <label className="text-[11px] font-medium text-white/50 block mb-1">Email</label>
-            <input value={email} onChange={e => setEmail(e.target.value)} type="email" className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50" placeholder="jane@magnivo.ai" />
-          </div>
-          <div>
-            <label className="text-[11px] font-medium text-white/50 block mb-1">Role</label>
-            <select value={role} onChange={e => setRole(e.target.value)} className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none">
-              {invitableRoles.map(r => (
-                <option key={r} value={r}>{roleConfig[r]?.label ?? r}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="text-[11px] font-medium text-white/50 block mb-1">Department</label>
-            <input value={department} onChange={e => setDepartment(e.target.value)} className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50" placeholder="Engineering" />
-          </div>
-        </div>
-        {error && <p className="text-[11px] text-red-400 mt-3">{error}</p>}
-        <div className="flex gap-2 mt-5">
-          <button onClick={onClose} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
-          <button onClick={handleSubmit} disabled={isPending} className="flex-1 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-[13px] text-white font-medium transition-colors flex items-center justify-center gap-2">
-            <Mail className="w-3.5 h-3.5" /> {isPending ? 'Sending…' : 'Send Invite'}
-          </button>
-        </div>
+        {!inviteLink ? (
+          <>
+            <h2 className="text-[16px] font-semibold text-white mb-1">Invite Team Member</h2>
+            <p className="text-[12px] text-white/40 mb-5">Send an invite to a Magnavo AI team member.</p>
+            <div className="space-y-3">
+              <div>
+                <label className="text-[11px] font-medium text-white/50 block mb-1">Full Name</label>
+                <input value={fullName} onChange={e => setFullName(e.target.value)} className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50" placeholder="Jane Smith" />
+              </div>
+              <div>
+                <label className="text-[11px] font-medium text-white/50 block mb-1">Email</label>
+                <input value={email} onChange={e => setEmail(e.target.value)} type="email" className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50" placeholder="jane@magnivo.ai" />
+              </div>
+              <div>
+                <label className="text-[11px] font-medium text-white/50 block mb-1">Role</label>
+                <select value={role} onChange={e => setRole(e.target.value)} className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none">
+                  {invitableRoles.map(r => (
+                    <option key={r} value={r}>{roleConfig[r]?.label ?? r}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="text-[11px] font-medium text-white/50 block mb-1">Department</label>
+                <input value={department} onChange={e => setDepartment(e.target.value)} className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none focus:border-violet-500/50" placeholder="Engineering" />
+              </div>
+            </div>
+            {error && <p className="text-[11px] text-red-400 mt-3">{error}</p>}
+            <div className="flex gap-2 mt-5">
+              <button onClick={onClose} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+              <button onClick={handleSubmit} disabled={isPending} className="flex-1 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 disabled:opacity-40 text-[13px] text-white font-medium transition-colors flex items-center justify-center gap-2">
+                <Mail className="w-3.5 h-3.5" /> {isPending ? 'Sending…' : 'Send Invite'}
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <h2 className="text-[16px] font-semibold text-white mb-1">Invite Sent</h2>
+            <p className="text-[12px] text-white/40 mb-4">
+              Share this invite link with {email} — no email has been sent automatically.
+            </p>
+            <div className="flex items-center gap-2 mb-2">
+              <input
+                readOnly
+                value={inviteLink}
+                onFocus={e => e.target.select()}
+                className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[12px] text-white/70 outline-none"
+              />
+              <button
+                onClick={copyInviteLink}
+                className="shrink-0 py-2 px-3 rounded-lg border border-white/[0.1] text-[12px] text-white/70 hover:text-white hover:bg-white/[0.06] transition-colors"
+              >
+                {linkCopied ? 'Copied!' : 'Copy Link'}
+              </button>
+            </div>
+            <button onClick={onClose} className="w-full mt-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors">Done</button>
+          </>
+        )}
       </div>
     </div>
   )

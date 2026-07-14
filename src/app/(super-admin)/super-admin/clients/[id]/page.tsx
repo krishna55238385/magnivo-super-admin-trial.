@@ -5,17 +5,19 @@ import {
   getSupportTicketsForClient,
   getAuditLogsForClient,
   getNotesForClient,
+  getPlans,
 } from '@/app/actions/super-admin'
 import ClientDetailView from './ClientDetailView'
 
 export default async function ClientDetailPage(props: { params: Promise<{ id: string }> }) {
   const { id } = await props.params
 
-  const [detail, tickets, auditLogs, notesResult] = await Promise.all([
+  const [detail, tickets, auditLogs, notesResult, plans] = await Promise.all([
     getClientDetail(id),
     getSupportTicketsForClient(id),
     getAuditLogsForClient(id),
     getNotesForClient(id),
+    getPlans(),
   ])
 
   if (!detail.org) {
@@ -40,6 +42,7 @@ export default async function ClientDetailPage(props: { params: Promise<{ id: st
       tickets={tickets}
       auditLogs={auditLogs}
       notes={notesResult.notes}
+      plans={plans}
     />
   )
 }

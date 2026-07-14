@@ -1,7 +1,9 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { cookies } from 'next/headers'
+import { cookies, headers } from 'next/headers'
+import bcrypt from 'bcryptjs'
+import { randomUUID } from 'crypto'
 import jwt from 'jsonwebtoken'
 import pool from '@/lib/db'
 
@@ -495,15 +497,17 @@ export async function issueInvoice(data: {
   let invoice
   try {
     const insertRes = await pool.query(
-      `INSERT INTO public.invoices (invoice_number, organization_id, plan_name, amount_cents, status, due_at, notes)
-       VALUES ($1, $2, $3, $4, 'pending', $5, $6) RETURNING *`,
-      [invoiceNum, data.orgId, data.planName, data.amountCents, data.dueDate, data.notes || null]
+      `INSERT INTO public.invoices (invoice_number, organization_id, amount_cents, status, due_date)
+       VALUES ($1, $2, $3, 'pending', $4) RETURNING *`,
+      [invoiceNum, data.orgId, data.amountCents, data.dueDate]
     )
     invoice = insertRes.rows[0]
   } catch (err: any) {
     return { error: err.message }
   }
 
+  // NOTE: invoices has no plan_name/notes columns — planName/notes are kept in the audit
+  // trail below since they can't be persisted on the invoice row itself.
   await pool.query(
     `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
     [
@@ -511,14 +515,16 @@ export async function issueInvoice(data: {
       'billing',
       invoiceNum,
       JSON.stringify({
-        message: `Manual invoice issued for $${(data.amountCents / 100).toFixed(2)}`,
+        message: `Manual invoice issued for $${(data.amountCents / 100).toFixed(2)} (${data.planName} plan)`,
         invoice_id: invoice.id,
+        notes: data.notes || null,
       }),
       'low',
     ]
   )
 
   revalidatePath('/super-admin/billing')
+  revalidatePath(`/super-admin/clients/${data.orgId}`)
   return { success: true, invoiceId: invoice.id, invoiceNumber: invoiceNum }
 }
 
@@ -863,12 +869,15 @@ export async function inviteTeamMember(data: {
   const auth = await requireSuperAdmin('all')
   if (!auth.ok) return { error: auth.error }
 
+  const inviteToken = randomUUID()
+  const inviteExpiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+
   let member
   try {
     const insertRes = await pool.query(
-      `INSERT INTO public.internal_team (email, full_name, role, department, is_active)
-       VALUES ($1, $2, $3, $4, false) RETURNING *`,
-      [data.email, data.fullName, data.role, data.department]
+      `INSERT INTO public.internal_team (email, full_name, role, department, status, invite_token, invite_expires_at)
+       VALUES ($1, $2, $3, $4, 'pending', $5, $6) RETURNING *`,
+      [data.email, data.fullName, data.role, data.department, inviteToken, inviteExpiresAt.toISOString()]
     )
     member = insertRes.rows[0]
   } catch (err: any) {
@@ -885,6 +894,74 @@ export async function inviteTeamMember(data: {
       'low',
     ]
   )
+
+  revalidatePath('/super-admin/team')
+
+  const host = (await headers()).get('host')
+  const protocol = host?.includes('localhost') ? 'http' : 'https'
+  return { success: true, inviteLink: `${protocol}://${host}/team/accept/${inviteToken}` }
+}
+
+type TeamInviteDetailsResult =
+  | { ok: false; error: 'invalid' | 'used' | 'expired' }
+  | { ok: true; member: { email: string; full_name: string; role: string } }
+
+export async function getTeamInviteDetails(token: string): Promise<TeamInviteDetailsResult> {
+  const { rows } = await safeQuery(
+    `SELECT email, full_name, role, status, invite_expires_at FROM public.internal_team WHERE invite_token = $1`,
+    [token]
+  )
+  const member = rows[0]
+  if (!member) return { ok: false, error: 'invalid' }
+  if (member.status !== 'pending') return { ok: false, error: 'used' }
+  if (member.invite_expires_at && new Date(member.invite_expires_at) < new Date()) return { ok: false, error: 'expired' }
+  return { ok: true, member }
+}
+
+export async function acceptTeamInvite(data: { token: string; fullName: string; password: string }) {
+  if (!data.fullName.trim()) return { error: 'Full name is required' }
+  if (!data.password || data.password.length < 8) return { error: 'Password must be at least 8 characters' }
+
+  const { rows } = await pool.query(
+    `SELECT id, email, role, status, invite_expires_at FROM public.internal_team WHERE invite_token = $1`,
+    [data.token]
+  )
+  const member = rows[0]
+  if (!member) return { error: 'Invalid invite link' }
+  if (member.status !== 'pending') return { error: 'This invite has already been used' }
+  if (member.invite_expires_at && new Date(member.invite_expires_at) < new Date()) {
+    return { error: 'This invite link has expired' }
+  }
+
+  const passwordHash = await bcrypt.hash(data.password, 10)
+  const fullName = data.fullName.trim()
+
+  const updateRes = await pool.query(
+    `UPDATE public.internal_team
+     SET password_hash = $1, full_name = $2, status = 'active', invite_token = NULL, invite_expires_at = NULL
+     WHERE id = $3 AND invite_token = $4`,
+    [passwordHash, fullName, member.id, data.token]
+  )
+  if (updateRes.rowCount === 0) return { error: 'This invite has already been used' }
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['team.invite_accepted', 'team', `${fullName} (${member.role})`, JSON.stringify({ message: `${member.email} accepted their invite` }), 'low']
+  )
+
+  const jwtToken = jwt.sign(
+    { userId: member.id, email: member.email, role: member.role, fullName },
+    JWT_SECRET,
+    { expiresIn: '7d' }
+  )
+  const cookieStore = await cookies()
+  cookieStore.set('magnivo_super_token', jwtToken, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 60 * 60 * 24 * 7,
+  })
 
   revalidatePath('/super-admin/team')
   return { success: true }
