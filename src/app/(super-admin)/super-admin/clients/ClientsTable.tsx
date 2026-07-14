@@ -1,12 +1,14 @@
 'use client'
 
 import { useMemo, useState } from 'react'
+import { useRouter } from 'next/navigation'
 import {
   Search, Plus, MoreHorizontal, ExternalLink,
   Eye, Settings, Ban, BookmarkPlus,
   Bookmark, X, CheckSquare, Square, CheckCircle2, Clock3,
 } from 'lucide-react'
 import Link from 'next/link'
+import { suspendClient, changeClientPlan } from '@/app/actions/super-admin'
 
 export type Client = {
   id: string
@@ -62,7 +64,12 @@ const DEFAULT_SAVED_VIEWS: SavedView[] = [
   { name: 'Enterprise Only', status: 'all', plan: 'enterprise', payment: 'all' },
 ]
 
+const PLAN_OPTIONS = ['Starter', 'Growth', 'Pro', 'Enterprise']
+
+type BulkResult = { success: number; fail: number; errors: string[] }
+
 export default function ClientsTable({ clients }: { clients: Client[] }) {
+  const router = useRouter()
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState('all')
   const [planFilter, setPlanFilter] = useState('all')
@@ -74,8 +81,13 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
   const [savedViews, setSavedViews] = useState<SavedView[]>(DEFAULT_SAVED_VIEWS)
   const [showSaveViewModal, setShowSaveViewModal] = useState(false)
   const [newViewName, setNewViewName] = useState('')
-  const [bulkAction, setBulkAction] = useState('')
+  const [bulkActionKey, setBulkActionKey] = useState<'' | 'upgrade' | 'suspend'>('')
   const [showBulkConfirm, setShowBulkConfirm] = useState(false)
+  const [bulkPlanTarget, setBulkPlanTarget] = useState(PLAN_OPTIONS[0])
+  const [bulkReason, setBulkReason] = useState('')
+  const [bulkPending, setBulkPending] = useState(false)
+  const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 })
+  const [bulkResult, setBulkResult] = useState<BulkResult | null>(null)
 
   const statusOptions = useMemo(
     () => ['all', ...Array.from(new Set(clients.map(c => c.status ?? 'unknown')))],
@@ -132,10 +144,75 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
     setShowSaveViewModal(false)
   }
 
-  function executeBulkAction() {
-    setSelected(new Set())
-    setBulkAction('')
+  function openBulkConfirm(key: string) {
+    if (key === 'export') {
+      exportSelectedCsv()
+      return
+    }
+    if (key === 'status') return // not implemented yet
+    setBulkActionKey(key as 'upgrade' | 'suspend')
+    setBulkResult(null)
+    setBulkReason('')
+    setBulkPlanTarget(PLAN_OPTIONS[0])
+    setShowBulkConfirm(true)
+  }
+
+  function closeBulkModal() {
+    if (bulkPending) return
     setShowBulkConfirm(false)
+    setBulkActionKey('')
+    setBulkResult(null)
+    setBulkReason('')
+    setSelected(new Set())
+  }
+
+  async function executeBulkAction() {
+    if (!bulkActionKey) return
+    const ids = Array.from(selected)
+    setBulkPending(true)
+    setBulkProgress({ done: 0, total: ids.length })
+
+    let success = 0
+    const errors: string[] = []
+    for (const id of ids) {
+      const clientName = clients.find(c => c.id === id)?.name ?? id
+      const result = bulkActionKey === 'suspend'
+        ? await suspendClient(id, bulkReason.trim() || 'Suspended via bulk action')
+        : await changeClientPlan(id, bulkPlanTarget)
+      if (result?.error) {
+        errors.push(`${clientName}: ${result.error}`)
+      } else {
+        success++
+      }
+      setBulkProgress(p => ({ ...p, done: p.done + 1 }))
+    }
+
+    setBulkPending(false)
+    setBulkResult({ success, fail: errors.length, errors })
+    router.refresh()
+  }
+
+  function exportSelectedCsv() {
+    const rows = filtered.filter(c => selected.has(c.id))
+    const escape = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)
+    const header = ['Client Name', 'Plan', 'Status', 'MRR', 'Users']
+    const body = rows.map(c => [
+      c.name,
+      c.plan_name ?? '',
+      c.status ?? '',
+      c.mrr_cents ? (c.mrr_cents / 100).toFixed(2) : '0',
+      String(c.user_count),
+    ])
+    const csv = [header, ...body].map(r => r.map(escape).join(',')).join('\n')
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `clients-export-${new Date().toISOString().slice(0, 10)}.csv`
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
   }
 
   const activeCount = clients.filter(c => c.status === 'active').length
@@ -233,8 +310,10 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
             ].map(a => (
               <button
                 key={a.value}
-                onClick={() => { setBulkAction(a.label); setShowBulkConfirm(true) }}
-                className={`text-[11px] px-3 py-1.5 rounded-lg border font-medium transition-colors ${
+                disabled={a.value === 'status'}
+                title={a.value === 'status' ? 'Not implemented yet' : undefined}
+                onClick={() => openBulkConfirm(a.value)}
+                className={`text-[11px] px-3 py-1.5 rounded-lg border font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
                   a.value === 'suspend'
                     ? 'bg-red-500/10 border-red-500/25 text-red-400 hover:bg-red-500/15'
                     : 'bg-white/[0.05] border-white/[0.1] text-white/60 hover:text-white hover:bg-white/[0.09]'
@@ -433,14 +512,72 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
 
       {/* Bulk action confirm */}
       {showBulkConfirm && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowBulkConfirm(false)}>
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={closeBulkModal}>
           <div className="bg-[#111118] border border-white/[0.1] rounded-2xl p-6 w-full max-w-sm" onClick={e => e.stopPropagation()}>
-            <h2 className="text-[15px] font-semibold text-white mb-2">Confirm: {bulkAction}</h2>
-            <p className="text-[12px] text-white/40 mb-5">This will apply to <span className="text-white/70 font-semibold">{selected.size} client{selected.size > 1 ? 's' : ''}</span>. Continue?</p>
-            <div className="flex gap-2">
-              <button onClick={() => setShowBulkConfirm(false)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
-              <button onClick={executeBulkAction} className="flex-1 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors">Confirm</button>
-            </div>
+            {!bulkResult ? (
+              <>
+                <h2 className="text-[15px] font-semibold text-white mb-2">
+                  {bulkActionKey === 'suspend' ? 'Suspend All' : 'Upgrade Plan'}
+                </h2>
+                <p className="text-[12px] text-white/40 mb-4">
+                  This will apply to <span className="text-white/70 font-semibold">{selected.size} client{selected.size > 1 ? 's' : ''}</span>.
+                </p>
+
+                {bulkActionKey === 'upgrade' && (
+                  <div className="mb-4">
+                    <label className="text-[11px] font-medium text-white/50 block mb-1">New Plan</label>
+                    <select
+                      value={bulkPlanTarget}
+                      onChange={e => setBulkPlanTarget(e.target.value)}
+                      disabled={bulkPending}
+                      className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none"
+                    >
+                      {PLAN_OPTIONS.map(p => <option key={p} value={p}>{p}</option>)}
+                    </select>
+                  </div>
+                )}
+
+                {bulkActionKey === 'suspend' && (
+                  <div className="mb-4">
+                    <label className="text-[11px] font-medium text-white/50 block mb-1">Reason (optional)</label>
+                    <input
+                      value={bulkReason}
+                      onChange={e => setBulkReason(e.target.value)}
+                      disabled={bulkPending}
+                      placeholder="Suspended via bulk action"
+                      className="w-full bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[13px] text-white/80 outline-none"
+                    />
+                  </div>
+                )}
+
+                {bulkPending && (
+                  <p className="text-[11px] text-violet-300 mb-3">Processing {bulkProgress.done} of {bulkProgress.total}…</p>
+                )}
+
+                <div className="flex gap-2">
+                  <button disabled={bulkPending} onClick={closeBulkModal} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors disabled:opacity-40">Cancel</button>
+                  <button disabled={bulkPending} onClick={executeBulkAction} className="flex-1 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors disabled:opacity-50">
+                    {bulkPending ? 'Processing…' : 'Confirm'}
+                  </button>
+                </div>
+              </>
+            ) : (
+              <>
+                <h2 className="text-[15px] font-semibold text-white mb-2">
+                  {bulkResult.fail === 0 ? 'Done' : 'Completed with errors'}
+                </h2>
+                <p className="text-[12px] text-white/70 mb-3">
+                  {bulkResult.success} of {bulkResult.success + bulkResult.fail} {bulkActionKey === 'suspend' ? 'suspended' : 'upgraded'}
+                  {bulkResult.fail > 0 && `, ${bulkResult.fail} failed`}
+                </p>
+                {bulkResult.errors.length > 0 && (
+                  <ul className="text-[11px] text-red-400 space-y-1 mb-4 max-h-32 overflow-y-auto">
+                    {bulkResult.errors.map((e, i) => <li key={i}>{e}</li>)}
+                  </ul>
+                )}
+                <button onClick={closeBulkModal} className="w-full py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors">Close</button>
+              </>
+            )}
           </div>
         </div>
       )}
