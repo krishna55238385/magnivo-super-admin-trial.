@@ -81,7 +81,7 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
   const [onboardErrors, setOnboardErrors] = useState<Record<string, string>>({})
   const [onboardPending, setOnboardPending] = useState(false)
   const [onboardError, setOnboardError] = useState<string | null>(null)
-  const [onboardInviteLink, setOnboardInviteLink] = useState<string | null>(null)
+  const [onboardResult, setOnboardResult] = useState<{ emailSent: boolean; inviteLink?: string; warning?: string } | null>(null)
   const [linkCopied, setLinkCopied] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [savedViews, setSavedViews] = useState<SavedView[]>(DEFAULT_SAVED_VIEWS)
@@ -154,14 +154,14 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
     setOnboardForm({ companyName: '', adminEmail: '', domain: '', plan: 'Starter' })
     setOnboardErrors({})
     setOnboardError(null)
-    setOnboardInviteLink(null)
+    setOnboardResult(null)
     setLinkCopied(false)
     setShowOnboardModal(true)
   }
 
   function closeOnboardModal() {
     if (onboardPending) return
-    const hadSuccess = !!onboardInviteLink
+    const hadSuccess = !!onboardResult
     setShowOnboardModal(false)
     if (hadSuccess) router.refresh()
   }
@@ -194,12 +194,12 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
       setOnboardError(result.error)
       return
     }
-    setOnboardInviteLink(result.inviteLink ?? null)
+    setOnboardResult({ emailSent: !!result.emailSent, inviteLink: result.inviteLink, warning: result.warning })
   }
 
   async function copyInviteLink() {
-    if (!onboardInviteLink) return
-    await navigator.clipboard.writeText(onboardInviteLink)
+    if (!onboardResult?.inviteLink) return
+    await navigator.clipboard.writeText(onboardResult.inviteLink)
     setLinkCopied(true)
     setTimeout(() => setLinkCopied(false), 2000)
   }
@@ -512,10 +512,10 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
       {showOnboardModal && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4" onClick={closeOnboardModal}>
           <div className="bg-[#111118] border border-white/[0.1] rounded-2xl p-6 w-full max-w-md" onClick={e => e.stopPropagation()}>
-            {!onboardInviteLink ? (
+            {!onboardResult ? (
               <>
                 <h2 className="text-[16px] font-semibold text-white mb-1">Onboard New Client</h2>
-                <p className="text-[12px] text-white/40 mb-5">Create a new organization and generate an admin invite link.</p>
+                <p className="text-[12px] text-white/40 mb-5">Create a new organization and send the admin their login credentials.</p>
                 <div className="space-y-3">
                   <div>
                     <label className="text-[11px] font-medium text-white/50 block mb-1">Company Name</label>
@@ -578,23 +578,34 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
             ) : (
               <>
                 <h2 className="text-[16px] font-semibold text-white mb-1">Client Created</h2>
-                <p className="text-[12px] text-white/40 mb-4">
-                  Share this invite link with {onboardForm.adminEmail} — no email has been sent automatically.
-                </p>
-                <div className="flex items-center gap-2 mb-2">
-                  <input
-                    readOnly
-                    value={onboardInviteLink}
-                    onFocus={e => e.target.select()}
-                    className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[12px] text-white/70 outline-none"
-                  />
-                  <button
-                    onClick={copyInviteLink}
-                    className="shrink-0 py-2 px-3 rounded-lg border border-white/[0.1] text-[12px] text-white/70 hover:text-white hover:bg-white/[0.06] transition-colors"
-                  >
-                    {linkCopied ? 'Copied!' : 'Copy Link'}
-                  </button>
-                </div>
+                {onboardResult.emailSent ? (
+                  <p className="text-[12px] text-white/40 mb-4">
+                    A welcome email with login credentials was sent to <span className="text-white/70">{onboardForm.adminEmail}</span>. They can log in right away.
+                  </p>
+                ) : (
+                  <>
+                    <p className="text-[12px] text-amber-400 mb-2">
+                      {onboardResult.warning || 'The welcome email failed to send.'}
+                    </p>
+                    <p className="text-[12px] text-white/40 mb-4">
+                      Share this invite link with {onboardForm.adminEmail} manually:
+                    </p>
+                    <div className="flex items-center gap-2 mb-2">
+                      <input
+                        readOnly
+                        value={onboardResult.inviteLink}
+                        onFocus={e => e.target.select()}
+                        className="flex-1 bg-white/[0.04] border border-white/[0.08] rounded-lg px-3 py-2 text-[12px] text-white/70 outline-none"
+                      />
+                      <button
+                        onClick={copyInviteLink}
+                        className="shrink-0 py-2 px-3 rounded-lg border border-white/[0.1] text-[12px] text-white/70 hover:text-white hover:bg-white/[0.06] transition-colors"
+                      >
+                        {linkCopied ? 'Copied!' : 'Copy Link'}
+                      </button>
+                    </div>
+                  </>
+                )}
                 <button onClick={closeOnboardModal} className="w-full mt-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-[13px] text-white font-medium transition-colors">Done</button>
               </>
             )}

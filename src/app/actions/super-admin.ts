@@ -5,6 +5,7 @@ import { cookies, headers } from 'next/headers'
 import bcrypt from 'bcryptjs'
 import { randomUUID } from 'crypto'
 import jwt from 'jsonwebtoken'
+import nodemailer from 'nodemailer'
 import pool from '@/lib/db'
 
 const JWT_SECRET = process.env.JWT_SECRET as string
@@ -227,6 +228,71 @@ export async function updateClientNotes(orgId: string, notes: string) {
   return { success: true }
 }
 
+// Avoids visually ambiguous characters (0/O, l/1/I) so a human re-typing the password doesn't mistype it
+function generateSystemPassword(): string {
+  const upper = 'ABCDEFGHJKMNPQRSTUVWXYZ'
+  const lower = 'abcdefghijkmnpqrstuvwxyz'
+  const digits = '23456789'
+  const symbols = '!@#$%^&*'
+  const all = upper + lower + digits + symbols
+  const pick = (chars: string) => chars[Math.floor(Math.random() * chars.length)]
+
+  const required = [pick(upper), pick(lower), pick(digits), pick(symbols)]
+  const rest = Array.from({ length: 8 }, () => pick(all))
+  const chars = [...required, ...rest]
+
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1))
+    ;[chars[i], chars[j]] = [chars[j], chars[i]]
+  }
+  return chars.join('')
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+}
+
+function buildWelcomeEmailHtml(email: string, password: string): string {
+  const safeEmail = escapeHtml(email)
+  const safePassword = escapeHtml(password)
+  return `
+    <div style="font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 480px; margin: 0 auto; color: #1a1a1a;">
+      <h2 style="color: #6d28d9; margin-bottom: 4px;">Welcome to Magnivo!</h2>
+      <p>Thank you for trying Magnivo! Here are your login credentials to get started:</p>
+      <table style="width: 100%; border-collapse: collapse; margin: 20px 0; background: #f8f7fc; border-radius: 8px;">
+        <tr>
+          <td style="padding: 12px 16px; color: #666; font-size: 13px;">Email</td>
+          <td style="padding: 12px 16px; font-weight: 600;">${safeEmail}</td>
+        </tr>
+        <tr>
+          <td style="padding: 12px 16px; color: #666; font-size: 13px;">Password</td>
+          <td style="padding: 12px 16px; font-weight: 600; font-family: monospace;">${safePassword}</td>
+        </tr>
+      </table>
+      <p>
+        <a href="https://magnivo-ai.vercel.app/login"
+           style="display: inline-block; background: #7c3aed; color: #fff; text-decoration: none; padding: 10px 22px; border-radius: 8px; font-weight: 600; font-size: 14px;">
+          Log in to Magnivo
+        </a>
+      </p>
+      <p style="color: #666; font-size: 13px; margin-top: 24px; line-height: 1.5;">
+        You can change your password anytime after logging in from your account settings.
+        Glad to have you on board — let us know if you need anything!
+      </p>
+    </div>
+  `
+}
+
+function getSystemMailer() {
+  return nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT || 587),
+    secure: false,
+    requireTLS: true,
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASSWORD },
+  })
+}
+
 export async function onboardClient(data: {
   companyName: string
   adminEmail: string
@@ -239,9 +305,12 @@ export async function onboardClient(data: {
   const trialEnd = new Date()
   trialEnd.setDate(trialEnd.getDate() + 14)
 
-  // NOTE: this creates a real organization_invites row (same mechanism the CRM's
-  // inviteUser() uses) and returns the link for the super admin to hand off manually.
-  // No email is sent automatically yet — that's a separate follow-up task.
+  const systemPassword = generateSystemPassword()
+  const passwordHash = await bcrypt.hash(systemPassword, 10)
+
+  // organization_invites is kept purely as a silent fallback record — the admin account
+  // below is created active and ready to log in immediately, so the invite link is only
+  // surfaced to the super admin if the welcome email fails to send.
   const client = await pool.connect()
   let org
   let inviteToken
@@ -260,6 +329,12 @@ export async function onboardClient(data: {
       [org.id, data.plan, trialEnd.toISOString()]
     )
 
+    await client.query(
+      `INSERT INTO public.users (organization_id, email, password_hash, role)
+       VALUES ($1, $2, $3, 'admin')`,
+      [org.id, data.adminEmail, passwordHash]
+    )
+
     const inviteRes = await client.query(
       `INSERT INTO public.organization_invites (organization_id, email, role, invited_by)
        VALUES ($1, $2, 'admin', NULL) RETURNING token`,
@@ -271,7 +346,7 @@ export async function onboardClient(data: {
       `INSERT INTO public.onboarding_tracker
          (organization_id, nda_status, msa_status, onboarding_form_status, data_auth_status, invoice_status, notes)
        VALUES ($1, 'not_sent', 'not_sent', 'not_sent', 'not_sent', 'not_issued', $2)`,
-      [org.id, `Admin invite link generated for ${data.adminEmail} (domain: ${data.domain}). Link was shown to the super admin on creation — no email sent automatically.`]
+      [org.id, `Admin account created directly for ${data.adminEmail} (domain: ${data.domain}). Welcome email with login credentials sent automatically; invite link kept as a fallback record only.`]
     )
 
     await client.query(
@@ -296,7 +371,29 @@ export async function onboardClient(data: {
 
   revalidatePath('/super-admin/clients')
   revalidatePath('/super-admin/onboarding')
-  return { success: true, orgId: org.id, inviteLink: `https://magnivo-ai.vercel.app/invite/${inviteToken}` }
+
+  const inviteLink = `https://magnivo-ai.vercel.app/invite/${inviteToken}`
+
+  try {
+    const transport = getSystemMailer()
+    await transport.sendMail({
+      from: process.env.SMTP_FROM,
+      to: data.adminEmail,
+      subject: 'Welcome to Magnivo — your login credentials',
+      html: buildWelcomeEmailHtml(data.adminEmail, systemPassword),
+    })
+  } catch (err: any) {
+    console.error('onboardClient: welcome email failed to send:', err)
+    return {
+      success: true,
+      orgId: org.id,
+      emailSent: false,
+      inviteLink,
+      warning: 'Client was created and the admin account is active, but the welcome email failed to send. Share the invite link below manually.',
+    }
+  }
+
+  return { success: true, orgId: org.id, emailSent: true }
 }
 
 export async function suspendClient(orgId: string, reason: string) {
