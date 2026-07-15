@@ -140,7 +140,7 @@ export async function getClientDetail(orgId: string) {
 
   const [orgRes, usersRes, invoicesRes, usageRes, subRes] = await Promise.all([
     safeQuery(`SELECT * FROM public.organizations WHERE id = $1`, [orgId]),
-    safeQuery(`SELECT id, full_name, role, created_at FROM public.users WHERE organization_id = $1`, [orgId]),
+    safeQuery(`SELECT id, full_name, email, role, is_active, created_at FROM public.users WHERE organization_id = $1`, [orgId]),
     safeQuery(`SELECT * FROM public.invoices WHERE organization_id = $1 ORDER BY issued_at DESC LIMIT 10`, [orgId]),
     safeQuery(
       `SELECT model, feature, total_tokens, estimated_cost_usd FROM public.token_usage_logs WHERE organization_id = $1 AND date >= $2`,
@@ -512,6 +512,129 @@ export async function updateDocumentStatus(orgId: string, field: string, status:
   )
 
   revalidatePath('/super-admin/onboarding')
+  revalidatePath('/super-admin/clients')
+  return { success: true }
+}
+
+// A client org's own end user — not an internal team member. Editable fields are limited
+// to profile info (full_name, email); role reassignment is out of scope here.
+export async function updateClientUser(userId: string, data: { full_name: string; email: string }) {
+  const auth = await requireSuperAdmin('all')
+  if (!auth.ok) return { error: auth.error }
+
+  const fullName = data.full_name.trim()
+  const email = data.email.trim()
+  if (!email) return { error: 'Email is required' }
+
+  const { rows } = await pool.query(
+    `SELECT organization_id, full_name, email, is_active FROM public.users WHERE id = $1`,
+    [userId]
+  )
+  const user = rows[0]
+  if (!user) return { error: 'User not found' }
+  if (user.is_active === false) return { error: 'Cannot edit a deactivated user — reactivate them first' }
+
+  let updateRes
+  try {
+    updateRes = await pool.query(
+      `UPDATE public.users SET full_name = $1, email = $2 WHERE id = $3`,
+      [fullName || null, email, userId]
+    )
+  } catch (err: any) {
+    if (err.code === '23505') return { error: 'Another user already has that email address' }
+    return { error: err.message || 'Failed to update user' }
+  }
+  if (updateRes.rowCount === 0) {
+    return { error: 'User not found' }
+  }
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'client_user.updated',
+      'client_user',
+      fullName || email || userId,
+      JSON.stringify({
+        message: `Updated user profile (name/email)`,
+        organization_id: user.organization_id,
+        user_id: userId,
+        old_full_name: user.full_name,
+        new_full_name: fullName || null,
+        old_email: user.email,
+        new_email: email,
+      }),
+      'medium',
+    ]
+  )
+
+  revalidatePath(`/super-admin/clients/${user.organization_id}`)
+  return { success: true }
+}
+
+// Soft-deactivate only — matches the CRM's own removeUser()/toggleUserSuspension() convention
+// (is_active = false), not a hard DELETE, so FK history (leads, deals, audit trail) is preserved.
+export async function deactivateClientUser(userId: string) {
+  const auth = await requireSuperAdmin('all')
+  if (!auth.ok) return { error: auth.error }
+
+  const updateRes = await pool.query(
+    `UPDATE public.users SET is_active = false WHERE id = $1 RETURNING organization_id, full_name, email`,
+    [userId]
+  )
+  if (updateRes.rowCount === 0) {
+    return { error: 'User not found' }
+  }
+  const user = updateRes.rows[0]
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'client_user.deactivated',
+      'client_user',
+      user.full_name || user.email || userId,
+      JSON.stringify({
+        message: `Deactivated ${user.email ?? userId} by ${auth.user.email}`,
+        organization_id: user.organization_id,
+        user_id: userId,
+      }),
+      'medium',
+    ]
+  )
+
+  revalidatePath(`/super-admin/clients/${user.organization_id}`)
+  revalidatePath('/super-admin/clients')
+  return { success: true }
+}
+
+export async function reactivateClientUser(userId: string) {
+  const auth = await requireSuperAdmin('all')
+  if (!auth.ok) return { error: auth.error }
+
+  const updateRes = await pool.query(
+    `UPDATE public.users SET is_active = true WHERE id = $1 RETURNING organization_id, full_name, email`,
+    [userId]
+  )
+  if (updateRes.rowCount === 0) {
+    return { error: 'User not found' }
+  }
+  const user = updateRes.rows[0]
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'client_user.reactivated',
+      'client_user',
+      user.full_name || user.email || userId,
+      JSON.stringify({
+        message: `Reactivated ${user.email ?? userId} by ${auth.user.email}`,
+        organization_id: user.organization_id,
+        user_id: userId,
+      }),
+      'medium',
+    ]
+  )
+
+  revalidatePath(`/super-admin/clients/${user.organization_id}`)
   revalidatePath('/super-admin/clients')
   return { success: true }
 }

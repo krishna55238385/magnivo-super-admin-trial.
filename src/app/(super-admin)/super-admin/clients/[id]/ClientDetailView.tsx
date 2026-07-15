@@ -6,11 +6,14 @@ import {
   ArrowLeft, Users, CreditCard, Zap, Settings,
   AlertCircle, ExternalLink, Shield,
   Globe, Calendar, DollarSign,
-  FileText, Ban, Edit2, Plus,
+  FileText, Ban, Edit2, Plus, RotateCcw,
   LifeBuoy, BarChart2, MessageSquare, Send, Clock, Lock, X, Activity
 } from 'lucide-react'
 import Link from 'next/link'
-import { suspendClient, changeClientPlan, updateClientNotes } from '@/app/actions/super-admin'
+import {
+  suspendClient, changeClientPlan, updateClientNotes,
+  updateClientUser, deactivateClientUser, reactivateClientUser,
+} from '@/app/actions/super-admin'
 import IssueInvoiceModal, { InvoicePlanOption } from '@/components/super-admin/IssueInvoiceModal'
 
 type Org = { id: string; name: string; created_at: string; timezone?: string | null; currency?: string | null; logo_url?: string | null }
@@ -91,6 +94,17 @@ export default function ClientDetailView({
   const [toast, setToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
   const [notesPending, setNotesPending] = useState(false)
   const [notesError, setNotesError] = useState<string | null>(null)
+  const [clientUsers, setClientUsers] = useState(users)
+  const [editUser, setEditUser] = useState<User | null>(null)
+  const [editFullName, setEditFullName] = useState('')
+  const [editEmail, setEditEmail] = useState('')
+  const [editUserPending, setEditUserPending] = useState(false)
+  const [editUserError, setEditUserError] = useState<string | null>(null)
+  const [deactivateUserTarget, setDeactivateUserTarget] = useState<User | null>(null)
+  const [deactivateUserInput, setDeactivateUserInput] = useState('')
+  const [deactivateUserPending, setDeactivateUserPending] = useState(false)
+  const [deactivateUserError, setDeactivateUserError] = useState<string | null>(null)
+  const [reactivatingUserId, setReactivatingUserId] = useState<string | null>(null)
 
   const dangerActions: Record<string, { label: string; confirmWord: string; color: string }> = {
     suspend: { label: 'Suspend Organization', confirmWord: 'SUSPEND', color: 'amber' },
@@ -162,6 +176,66 @@ export default function ClientDetailView({
     setToast({ type: 'success', text: 'Notes saved.' })
   }
 
+  function openEditUser(u: User) {
+    setEditUser(u)
+    setEditFullName(u.full_name ?? '')
+    setEditEmail(u.email ?? '')
+    setEditUserError(null)
+  }
+
+  async function handleEditUserConfirm() {
+    if (!editUser) return
+    const email = editEmail.trim()
+    if (!email) {
+      setEditUserError('Email is required')
+      return
+    }
+    setEditUserPending(true)
+    setEditUserError(null)
+    const result = await updateClientUser(editUser.id, { full_name: editFullName.trim(), email })
+    setEditUserPending(false)
+    if (result?.error) {
+      setEditUserError(result.error)
+      return
+    }
+    setClientUsers(prev => prev.map(u => (u.id === editUser.id ? { ...u, full_name: editFullName.trim() || null, email } : u)))
+    setToast({ type: 'success', text: `${editFullName.trim() || email}'s profile was updated.` })
+    setEditUser(null)
+  }
+
+  function openDeactivateUser(u: User) {
+    setDeactivateUserTarget(u)
+    setDeactivateUserInput('')
+    setDeactivateUserError(null)
+  }
+
+  async function handleDeactivateUserConfirm() {
+    if (!deactivateUserTarget) return
+    setDeactivateUserPending(true)
+    setDeactivateUserError(null)
+    const result = await deactivateClientUser(deactivateUserTarget.id)
+    setDeactivateUserPending(false)
+    if (result?.error) {
+      setDeactivateUserError(result.error)
+      return
+    }
+    setClientUsers(prev => prev.map(u => (u.id === deactivateUserTarget.id ? { ...u, is_active: false } : u)))
+    setToast({ type: 'success', text: `${deactivateUserTarget.full_name || deactivateUserTarget.email || 'User'} has been deactivated.` })
+    setDeactivateUserTarget(null)
+  }
+
+  async function handleReactivateUser(u: User) {
+    setReactivatingUserId(u.id)
+    const result = await reactivateClientUser(u.id)
+    setReactivatingUserId(null)
+    if (result?.error) {
+      setToast({ type: 'error', text: result.error })
+      return
+    }
+    setClientUsers(prev => prev.map(x => (x.id === u.id ? { ...x, is_active: true } : x)))
+    setToast({ type: 'success', text: `${u.full_name || u.email || 'User'} has been reactivated.` })
+  }
+
   function handleInvoiceSuccess(message: string) {
     setShowIssueModal(false)
     router.refresh()
@@ -225,7 +299,7 @@ export default function ClientDetailView({
       {/* KPI bar */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: 'Total Users', value: users.length, sub: `${users.filter(u => u.is_active !== false).length} active`, icon: Users, color: 'text-blue-400' },
+          { label: 'Total Users', value: clientUsers.length, sub: `${clientUsers.filter(u => u.is_active !== false).length} active`, icon: Users, color: 'text-blue-400' },
           { label: 'Tokens (30d)', value: totalTokens30d.toLocaleString(), sub: `${usageSummary.length} model/feature combos`, icon: Zap, color: 'text-amber-400' },
           { label: 'Open Tickets', value: openTicketCount, sub: `${tickets.length} total`, icon: LifeBuoy, color: 'text-violet-400' },
           { label: 'Total Invoiced', value: `$${(totalInvoicedCents / 100).toLocaleString()}`, sub: `${invoices.length} invoices`, icon: DollarSign, color: 'text-emerald-400' },
@@ -330,7 +404,7 @@ export default function ClientDetailView({
       {tab === 'Users' && (
         <div className="bg-[#111118] border border-white/[0.07] rounded-xl overflow-hidden">
           <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
-            <p className="text-[13px] font-semibold text-white">{users.length} Users</p>
+            <p className="text-[13px] font-semibold text-white">{clientUsers.length} Users</p>
             <button className="flex items-center gap-1.5 bg-violet-600/20 border border-violet-500/30 text-violet-400 text-[12px] px-3 py-1.5 rounded-lg hover:bg-violet-600/30 transition-colors">
               <Plus className="w-3.5 h-3.5" /> Add User
             </button>
@@ -344,10 +418,10 @@ export default function ClientDetailView({
               </tr>
             </thead>
             <tbody>
-              {users.length === 0 && (
+              {clientUsers.length === 0 && (
                 <tr><td colSpan={6} className="px-5 py-8 text-center text-[12px] text-white/30">No users found.</td></tr>
               )}
-              {users.map(u => (
+              {clientUsers.map(u => (
                 <tr key={u.id} className="border-b border-white/[0.04] hover:bg-white/[0.02] group">
                   <td className="px-5 py-3">
                     <div className="flex items-center gap-2">
@@ -371,10 +445,20 @@ export default function ClientDetailView({
                     </div>
                   </td>
                   <td className="px-5 py-3">
-                    <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                      <button className="text-[11px] text-white/40 hover:text-white/70 px-2 py-1 rounded border border-white/[0.06] hover:border-white/[0.15] transition-colors">Edit</button>
-                      <button className="text-[11px] text-red-400 hover:text-red-300 px-2 py-1 rounded border border-red-500/20 hover:border-red-500/40 transition-colors">Remove</button>
-                    </div>
+                    {u.is_active === false ? (
+                      <button
+                        onClick={() => handleReactivateUser(u)}
+                        disabled={reactivatingUserId === u.id}
+                        className="inline-flex items-center gap-1.5 text-[11px] text-white/50 hover:text-white disabled:opacity-40 transition-colors"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" /> {reactivatingUserId === u.id ? 'Reactivating…' : 'Reactivate'}
+                      </button>
+                    ) : (
+                      <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                        <button onClick={() => openEditUser(u)} className="text-[11px] text-white/40 hover:text-white/70 px-2 py-1 rounded border border-white/[0.06] hover:border-white/[0.15] transition-colors">Edit</button>
+                        <button onClick={() => openDeactivateUser(u)} className="text-[11px] text-red-400 hover:text-red-300 px-2 py-1 rounded border border-red-500/20 hover:border-red-500/40 transition-colors">Remove</button>
+                      </div>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -715,6 +799,72 @@ export default function ClientDetailView({
                 className="flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed bg-violet-600 hover:bg-violet-500"
               >
                 {planPending ? 'Working…' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit user modal */}
+      {editUser && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setEditUser(null)}>
+          <div className="bg-[#111118] border border-white/[0.12] rounded-2xl p-6 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <h2 className="text-[15px] font-semibold text-white mb-1">Edit User</h2>
+            <p className="text-[12px] text-white/40 mb-4">
+              Update profile details for this user in {org.name}.
+            </p>
+            <label className="text-[11px] font-medium text-white/50 block mb-1">Full Name</label>
+            <input
+              value={editFullName}
+              onChange={e => setEditFullName(e.target.value)}
+              className="w-full bg-white/[0.04] border border-white/[0.08] focus:border-violet-500/50 rounded-lg px-3 py-2 text-[13px] text-white outline-none mb-3"
+              placeholder="Jane Doe"
+            />
+            <label className="text-[11px] font-medium text-white/50 block mb-1">Email</label>
+            <input
+              value={editEmail}
+              onChange={e => setEditEmail(e.target.value)}
+              className="w-full bg-white/[0.04] border border-white/[0.08] focus:border-violet-500/50 rounded-lg px-3 py-2 text-[13px] text-white outline-none mb-4"
+              placeholder="jane@acmecorp.com"
+            />
+            {editUserError && <p className="text-[11px] text-red-400 mb-3">{editUserError}</p>}
+            <div className="flex gap-2">
+              <button onClick={() => setEditUser(null)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+              <button
+                onClick={handleEditUserConfirm}
+                disabled={!editEmail.trim() || (editFullName.trim() === (editUser.full_name ?? '') && editEmail.trim() === (editUser.email ?? '')) || editUserPending}
+                className="flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed bg-violet-600 hover:bg-violet-500"
+              >
+                {editUserPending ? 'Working…' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Deactivate user confirm modal */}
+      {deactivateUserTarget && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setDeactivateUserTarget(null)}>
+          <div className="bg-[#111118] border border-white/[0.12] rounded-2xl p-6 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <h2 className="text-[15px] font-semibold text-red-400 mb-2">Deactivate {deactivateUserTarget.full_name || deactivateUserTarget.email || 'this user'}</h2>
+            <p className="text-[12px] text-white/40 mb-4">
+              Type <span className="font-mono font-bold text-red-400">DEACTIVATE</span> to confirm. They will immediately lose access to {org.name}'s workspace.
+            </p>
+            <input
+              value={deactivateUserInput}
+              onChange={e => setDeactivateUserInput(e.target.value)}
+              className="w-full bg-white/[0.04] border border-red-500/30 focus:border-red-500/60 rounded-lg px-3 py-2 text-[13px] text-white outline-none mb-4"
+              placeholder="DEACTIVATE"
+            />
+            {deactivateUserError && <p className="text-[11px] text-red-400 mb-3">{deactivateUserError}</p>}
+            <div className="flex gap-2">
+              <button onClick={() => setDeactivateUserTarget(null)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+              <button
+                onClick={handleDeactivateUserConfirm}
+                disabled={deactivateUserInput !== 'DEACTIVATE' || deactivateUserPending}
+                className="flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed bg-red-600 hover:bg-red-500"
+              >
+                {deactivateUserPending ? 'Working…' : 'Confirm'}
               </button>
             </div>
           </div>
