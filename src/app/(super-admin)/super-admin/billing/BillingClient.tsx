@@ -69,11 +69,11 @@ function normalizeFeatures(features: Plan['features']): string[] {
   if (!features) return []
 
   let parsed: unknown = features
-  if (typeof parsed === 'string') {
+  if (typeof features === 'string') {
     try {
-      parsed = JSON.parse(parsed)
+      parsed = JSON.parse(features)
     } catch {
-      return [parsed]
+      return [features]
     }
   }
 
