@@ -11,7 +11,7 @@ import {
 } from 'lucide-react'
 import Link from 'next/link'
 import {
-  suspendClient, changeClientPlan, updateClientNotes,
+  suspendClient, deleteOrganization, changeClientPlan, updateClientNotes,
   updateClientUser, deactivateClientUser, reactivateClientUser,
   setClientUserLimit,
 } from '@/app/actions/super-admin'
@@ -137,21 +137,28 @@ export default function ClientDetailView({
 
   async function handleDangerConfirm() {
     if (!showDangerConfirm) return
-    if (showDangerConfirm !== 'suspend') {
+    if (showDangerConfirm !== 'suspend' && showDangerConfirm !== 'delete') {
       setDangerError('This action is not implemented yet.')
       return
     }
     setDangerPending(true)
     setDangerError(null)
-    const result = await suspendClient(org.id, dangerReason.trim() || 'Suspended via admin dashboard')
+    const result = showDangerConfirm === 'suspend'
+      ? await suspendClient(org.id, dangerReason.trim() || 'Suspended via admin dashboard')
+      : await deleteOrganization(org.id)
     setDangerPending(false)
     if (result?.error) {
       setDangerError(result.error)
       return
     }
-    setClientStatus('suspended')
+    if (showDangerConfirm === 'suspend') {
+      setClientStatus('suspended')
+      setShowDangerConfirm(null)
+      setToast({ type: 'success', text: `${org.name} has been suspended.` })
+      return
+    }
     setShowDangerConfirm(null)
-    setToast({ type: 'success', text: `${org.name} has been suspended.` })
+    router.push('/super-admin/clients')
   }
 
   function openPlanModal() {

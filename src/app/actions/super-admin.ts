@@ -132,6 +132,7 @@ export async function getAllClients() {
        ORDER BY ot.created_at DESC
        LIMIT 1
      ) ot ON true
+     WHERE o.deleted_at IS NULL
      ORDER BY o.created_at DESC`
   )
 
@@ -435,6 +436,28 @@ export async function suspendClient(orgId: string, reason: string) {
   await pool.query(
     `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
     ['client.suspended', 'client', orgId, JSON.stringify({ message: reason }), 'high']
+  )
+
+  revalidatePath('/super-admin/clients')
+  revalidatePath(`/super-admin/clients/${orgId}`)
+  return { success: true }
+}
+
+export async function deleteOrganization(orgId: string) {
+  const auth = await requireSuperAdmin('all')
+  if (!auth.ok) return { error: auth.error }
+
+  const updateRes = await pool.query(
+    `UPDATE public.organizations SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL`,
+    [orgId]
+  )
+  if (updateRes.rowCount === 0) {
+    return { error: 'Organization not found or already deleted' }
+  }
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    ['client.deleted', 'client', orgId, JSON.stringify({ message: `Archived by ${auth.user.email}` }), 'high']
   )
 
   revalidatePath('/super-admin/clients')
@@ -840,7 +863,7 @@ export async function getMRRBreakdown() {
        cs.trial_ends_at AS renewal_date
      FROM public.client_subscriptions cs
      JOIN public.organizations o ON o.id = cs.organization_id
-     WHERE cs.status IN ('active', 'trial')
+     WHERE cs.status IN ('active', 'trial') AND o.deleted_at IS NULL
      ORDER BY cs.mrr_cents DESC`
   )
 
@@ -1363,7 +1386,7 @@ export async function getPlatformStats(range: '30d' | '90d' | 'year' = '30d') {
     suspendedRes,
     rangeCostRes,
   ] = await Promise.all([
-    safeQuery(`SELECT COUNT(*)::int AS count FROM public.organizations`),
+    safeQuery(`SELECT COUNT(*)::int AS count FROM public.organizations WHERE deleted_at IS NULL`),
     safeQuery(`SELECT COUNT(*)::int AS count FROM public.users`),
     safeQuery(
       `SELECT COALESCE(SUM(mrr_cents), 0)::bigint AS total FROM public.client_subscriptions WHERE status = 'active'`
@@ -1431,6 +1454,7 @@ export async function getTopClientsByRevenue(limit: number = 5) {
      FROM public.organizations o
      LEFT JOIN public.client_subscriptions cs ON cs.organization_id = o.id
      LEFT JOIN public.users u ON u.organization_id = o.id
+     WHERE o.deleted_at IS NULL
      GROUP BY o.id, o.name, cs.plan_name, cs.mrr_cents, cs.status
      ORDER BY cs.mrr_cents DESC NULLS LAST
      LIMIT $1`,
