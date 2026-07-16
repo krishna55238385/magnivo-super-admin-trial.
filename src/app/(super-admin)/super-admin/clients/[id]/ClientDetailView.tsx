@@ -13,6 +13,7 @@ import Link from 'next/link'
 import {
   suspendClient, changeClientPlan, updateClientNotes,
   updateClientUser, deactivateClientUser, reactivateClientUser,
+  setClientUserLimit,
 } from '@/app/actions/super-admin'
 import IssueInvoiceModal, { InvoicePlanOption } from '@/components/super-admin/IssueInvoiceModal'
 
@@ -63,6 +64,7 @@ const OPEN_TICKET_STATUSES = new Set(['open', 'in_progress', 'waiting'])
 
 export default function ClientDetailView({
   org, users, invoices, usageSummary, status, plan, tickets, auditLogs, notes: initialNotes, plans,
+  userLimit, planMaxUsers,
 }: {
   org: Org
   users: User[]
@@ -74,6 +76,8 @@ export default function ClientDetailView({
   auditLogs: AuditLog[]
   notes: string | null
   plans: InvoicePlanOption[]
+  userLimit: number | null
+  planMaxUsers: number | null
 }) {
   const router = useRouter()
   const [tab, setTab] = useState('Overview')
@@ -105,6 +109,13 @@ export default function ClientDetailView({
   const [deactivateUserPending, setDeactivateUserPending] = useState(false)
   const [deactivateUserError, setDeactivateUserError] = useState<string | null>(null)
   const [reactivatingUserId, setReactivatingUserId] = useState<string | null>(null)
+  const [userLimitOverride, setUserLimitOverride] = useState<number | null>(userLimit)
+  const [showUserLimitModal, setShowUserLimitModal] = useState(false)
+  const [userLimitInput, setUserLimitInput] = useState('')
+  const [userLimitPending, setUserLimitPending] = useState(false)
+  const [userLimitError, setUserLimitError] = useState<string | null>(null)
+
+  const effectiveUserLimit = userLimitOverride ?? planMaxUsers
 
   const dangerActions: Record<string, { label: string; confirmWord: string; color: string }> = {
     suspend: { label: 'Suspend Organization', confirmWord: 'SUSPEND', color: 'amber' },
@@ -236,6 +247,41 @@ export default function ClientDetailView({
     setToast({ type: 'success', text: `${u.full_name || u.email || 'User'} has been reactivated.` })
   }
 
+  function openUserLimitModal() {
+    setUserLimitInput(userLimitOverride != null ? String(userLimitOverride) : '')
+    setUserLimitError(null)
+    setShowUserLimitModal(true)
+  }
+
+  async function handleUserLimitConfirm() {
+    const trimmed = userLimitInput.trim()
+    let parsed: number | null = null
+    if (trimmed !== '') {
+      const n = Number(trimmed)
+      if (!Number.isInteger(n) || n <= 0) {
+        setUserLimitError('Enter a positive whole number, or leave blank to inherit the plan default')
+        return
+      }
+      parsed = n
+    }
+    setUserLimitPending(true)
+    setUserLimitError(null)
+    const result = await setClientUserLimit(org.id, parsed)
+    setUserLimitPending(false)
+    if (result?.error) {
+      setUserLimitError(result.error)
+      return
+    }
+    setUserLimitOverride(parsed)
+    setShowUserLimitModal(false)
+    setToast({
+      type: 'success',
+      text: parsed === null
+        ? `${org.name}'s user limit now inherits the ${clientPlan} plan default.`
+        : `${org.name}'s user limit set to ${parsed}.`,
+    })
+  }
+
   function handleInvoiceSuccess(message: string) {
     setShowIssueModal(false)
     router.refresh()
@@ -243,6 +289,7 @@ export default function ClientDetailView({
   }
 
   const totalTokens30d = usageSummary.reduce((sum, r) => sum + (Number(r.total_tokens) || 0), 0)
+  const activeUserCount = clientUsers.filter(u => u.is_active !== false).length
   const openTicketCount = tickets.filter(t => OPEN_TICKET_STATUSES.has(t.status ?? '')).length
   const totalInvoicedCents = invoices.reduce((sum, i) => sum + (Number(i.amount_cents) || 0), 0)
 
@@ -299,7 +346,7 @@ export default function ClientDetailView({
       {/* KPI bar */}
       <div className="grid grid-cols-4 gap-3">
         {[
-          { label: 'Total Users', value: clientUsers.length, sub: `${clientUsers.filter(u => u.is_active !== false).length} active`, icon: Users, color: 'text-blue-400' },
+          { label: 'Total Users', value: clientUsers.length, sub: `${activeUserCount} / ${effectiveUserLimit ?? '∞'} active`, icon: Users, color: 'text-blue-400' },
           { label: 'Tokens (30d)', value: totalTokens30d.toLocaleString(), sub: `${usageSummary.length} model/feature combos`, icon: Zap, color: 'text-amber-400' },
           { label: 'Open Tickets', value: openTicketCount, sub: `${tickets.length} total`, icon: LifeBuoy, color: 'text-violet-400' },
           { label: 'Total Invoiced', value: `$${(totalInvoicedCents / 100).toLocaleString()}`, sub: `${invoices.length} invoices`, icon: DollarSign, color: 'text-emerald-400' },
@@ -404,10 +451,24 @@ export default function ClientDetailView({
       {tab === 'Users' && (
         <div className="bg-[#111118] border border-white/[0.07] rounded-xl overflow-hidden">
           <div className="flex items-center justify-between px-5 py-4 border-b border-white/[0.06]">
-            <p className="text-[13px] font-semibold text-white">{clientUsers.length} Users</p>
-            <button className="flex items-center gap-1.5 bg-violet-600/20 border border-violet-500/30 text-violet-400 text-[12px] px-3 py-1.5 rounded-lg hover:bg-violet-600/30 transition-colors">
-              <Plus className="w-3.5 h-3.5" /> Add User
-            </button>
+            <div>
+              <p className="text-[13px] font-semibold text-white">{clientUsers.length} Users</p>
+              <p className="text-[11px] text-white/40 mt-0.5">
+                {activeUserCount} / {effectiveUserLimit ?? '∞'} active seats used
+                {userLimitOverride != null && <span className="text-violet-400"> · custom limit</span>}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={openUserLimitModal}
+                className="flex items-center gap-1.5 bg-white/[0.05] border border-white/[0.08] text-white/60 text-[12px] px-3 py-1.5 rounded-lg hover:bg-white/[0.08] transition-colors"
+              >
+                <Edit2 className="w-3.5 h-3.5" /> Edit Limit
+              </button>
+              <button className="flex items-center gap-1.5 bg-violet-600/20 border border-violet-500/30 text-violet-400 text-[12px] px-3 py-1.5 rounded-lg hover:bg-violet-600/30 transition-colors">
+                <Plus className="w-3.5 h-3.5" /> Add User
+              </button>
+            </div>
           </div>
           <table className="w-full">
             <thead>
@@ -799,6 +860,39 @@ export default function ClientDetailView({
                 className="flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed bg-violet-600 hover:bg-violet-500"
               >
                 {planPending ? 'Working…' : 'Confirm'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Set User Limit modal */}
+      {showUserLimitModal && (
+        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4" onClick={() => setShowUserLimitModal(false)}>
+          <div className="bg-[#111118] border border-white/[0.12] rounded-2xl p-6 w-full max-w-sm" onClick={e => e.stopPropagation()}>
+            <h2 className="text-[15px] font-semibold text-white mb-1">Set User Limit</h2>
+            <p className="text-[12px] text-white/40 mb-4">
+              Override the seat cap for {org.name}. Leave blank to inherit the {clientPlan} plan default
+              {planMaxUsers != null ? ` (${planMaxUsers})` : ' (unlimited)'}.
+            </p>
+            <label className="text-[11px] font-medium text-white/50 block mb-1">User Limit</label>
+            <input
+              value={userLimitInput}
+              onChange={e => { setUserLimitInput(e.target.value); setUserLimitError(null) }}
+              className="w-full bg-white/[0.04] border border-white/[0.08] focus:border-violet-500/50 rounded-lg px-3 py-2 text-[13px] text-white outline-none mb-1"
+              placeholder={planMaxUsers != null ? String(planMaxUsers) : 'Unlimited'}
+              inputMode="numeric"
+            />
+            <p className="text-[10px] text-white/25 mb-4">Blank = inherit plan default. Currently {activeUserCount} active user{activeUserCount === 1 ? '' : 's'}.</p>
+            {userLimitError && <p className="text-[11px] text-red-400 mb-3">{userLimitError}</p>}
+            <div className="flex gap-2">
+              <button onClick={() => setShowUserLimitModal(false)} className="flex-1 py-2 rounded-lg border border-white/[0.08] text-[13px] text-white/50 hover:text-white transition-colors">Cancel</button>
+              <button
+                onClick={handleUserLimitConfirm}
+                disabled={userLimitPending}
+                className="flex-1 py-2 rounded-lg text-[13px] text-white font-medium transition-colors disabled:opacity-30 disabled:cursor-not-allowed bg-violet-600 hover:bg-violet-500"
+              >
+                {userLimitPending ? 'Working…' : 'Confirm'}
               </button>
             </div>
           </div>

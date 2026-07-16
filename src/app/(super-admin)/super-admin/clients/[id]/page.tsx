@@ -43,6 +43,8 @@ export default async function ClientDetailPage(props: { params: Promise<{ id: st
       auditLogs={auditLogs}
       notes={notesResult.notes}
       plans={plans}
+      userLimit={detail.userLimit}
+      planMaxUsers={detail.planMaxUsers}
     />
   )
 }

@@ -15,6 +15,8 @@ export type Client = {
   name: string
   created_at: string
   user_count: number
+  active_user_count: number
+  user_limit: number | null
   plan_name: string | null
   status: string | null
   mrr_cents: number | null
@@ -261,7 +263,7 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
       c.plan_name ?? '',
       c.status ?? '',
       c.mrr_cents ? (c.mrr_cents / 100).toFixed(2) : '0',
-      String(c.user_count),
+      `${c.active_user_count}/${c.user_limit ?? 'unlimited'}`,
     ])
     const csv = [header, ...body].map(r => r.map(escape).join(',')).join('\n')
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
@@ -448,7 +450,11 @@ export default function ClientsTable({ clients }: { clients: Client[] }) {
                       {formatLabel(statusKey)}
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-[13px] text-white/60">{c.user_count}</td>
+                  <td className="px-4 py-3 text-[13px]">
+                    <span className={c.user_limit != null && c.active_user_count >= c.user_limit ? 'text-amber-400 font-medium' : 'text-white/60'}>
+                      {c.active_user_count} / {c.user_limit ?? '∞'}
+                    </span>
+                  </td>
                   <td className="px-4 py-3 text-[13px] font-semibold text-white/85">
                     {c.mrr_cents ? `$${(c.mrr_cents / 100).toLocaleString()}` : '—'}
                   </td>

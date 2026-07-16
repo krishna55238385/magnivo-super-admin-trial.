@@ -71,6 +71,23 @@ async function safeQuery(sql: string, params: any[] = []) {
 const NOT_STARTED_STATUSES = new Set(['not_sent', 'not_issued'])
 const isStepDone = (status: string | null) => status != null && !NOT_STARTED_STATUSES.has(status)
 
+// Effective seat cap for an org = the per-org override if set, else the plan's default max_users.
+// NULL means unlimited (e.g. Enterprise, or any plan with no max_users configured).
+async function getEffectiveUserLimit(orgId: string): Promise<{ userLimit: number | null; planMaxUsers: number | null; effectiveLimit: number | null }> {
+  const { rows } = await safeQuery(
+    `SELECT cs.user_limit, p.max_users AS plan_max_users
+     FROM public.client_subscriptions cs
+     LEFT JOIN public.plans p ON LOWER(p.name) = LOWER(cs.plan_name)
+     WHERE cs.organization_id = $1
+     ORDER BY cs.created_at DESC
+     LIMIT 1`,
+    [orgId]
+  )
+  const userLimit = rows[0]?.user_limit ?? null
+  const planMaxUsers = rows[0]?.plan_max_users ?? null
+  return { userLimit, planMaxUsers, effectiveLimit: userLimit ?? planMaxUsers }
+}
+
 export async function getAllClients() {
   const auth = await requireSuperAdmin('view_clients')
   if (!auth.ok) return []
@@ -81,10 +98,12 @@ export async function getAllClients() {
        o.name,
        o.created_at,
        COALESCE(uc.user_count, 0)::int AS user_count,
+       COALESCE(uc.active_user_count, 0)::int AS active_user_count,
        COALESCE(cs.plan_name, 'trial') AS plan_name,
        COALESCE(cs.status, 'trial') AS status,
        COALESCE(cs.mrr_cents, 0) AS mrr_cents,
        cs.payment_status,
+       COALESCE(cs.user_limit, p.max_users) AS user_limit,
        ot.nda_status,
        ot.msa_status,
        ot.onboarding_form_status,
@@ -92,17 +111,20 @@ export async function getAllClients() {
        ot.invoice_status
      FROM public.organizations o
      LEFT JOIN (
-       SELECT organization_id, COUNT(*)::int AS user_count
+       SELECT organization_id,
+              COUNT(*)::int AS user_count,
+              COUNT(*) FILTER (WHERE is_active = true)::int AS active_user_count
        FROM public.users
        GROUP BY organization_id
      ) uc ON uc.organization_id = o.id
      LEFT JOIN LATERAL (
-       SELECT plan_name, status, mrr_cents, payment_status
+       SELECT plan_name, status, mrr_cents, payment_status, user_limit
        FROM public.client_subscriptions cs
        WHERE cs.organization_id = o.id
        ORDER BY cs.created_at DESC
        LIMIT 1
      ) cs ON true
+     LEFT JOIN public.plans p ON LOWER(p.name) = LOWER(cs.plan_name)
      LEFT JOIN LATERAL (
        SELECT nda_status, msa_status, onboarding_form_status, data_auth_status, invoice_status
        FROM public.onboarding_tracker ot
@@ -118,6 +140,8 @@ export async function getAllClients() {
     name: r.name,
     created_at: r.created_at,
     user_count: r.user_count,
+    active_user_count: r.active_user_count,
+    user_limit: r.user_limit === null ? null : Number(r.user_limit),
     plan_name: r.plan_name,
     status: r.status,
     mrr_cents: r.mrr_cents,
@@ -134,11 +158,11 @@ export async function getAllClients() {
 
 export async function getClientDetail(orgId: string) {
   const auth = await requireSuperAdmin()
-  if (!auth.ok) return { org: null, users: [], invoices: [], usageSummary: [] }
+  if (!auth.ok) return { org: null, users: [], invoices: [], usageSummary: [], status: 'trial', plan: 'Starter', userLimit: null, planMaxUsers: null }
 
   const since = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10)
 
-  const [orgRes, usersRes, invoicesRes, usageRes, subRes] = await Promise.all([
+  const [orgRes, usersRes, invoicesRes, usageRes, subRes, limits] = await Promise.all([
     safeQuery(`SELECT * FROM public.organizations WHERE id = $1`, [orgId]),
     safeQuery(`SELECT id, full_name, email, role, is_active, created_at FROM public.users WHERE organization_id = $1`, [orgId]),
     safeQuery(`SELECT * FROM public.invoices WHERE organization_id = $1 ORDER BY issued_at DESC LIMIT 10`, [orgId]),
@@ -150,6 +174,7 @@ export async function getClientDetail(orgId: string) {
       `SELECT status, plan_name FROM public.client_subscriptions WHERE organization_id = $1 ORDER BY created_at DESC LIMIT 1`,
       [orgId]
     ),
+    getEffectiveUserLimit(orgId),
   ])
 
   return {
@@ -159,6 +184,8 @@ export async function getClientDetail(orgId: string) {
     usageSummary: usageRes.rows,
     status: subRes.rows[0]?.status || 'trial',
     plan: subRes.rows[0]?.plan_name || 'Starter',
+    userLimit: limits.userLimit,
+    planMaxUsers: limits.planMaxUsers,
   }
 }
 
@@ -445,6 +472,52 @@ export async function changeClientPlan(orgId: string, newPlan: string) {
     ]
   )
 
+  revalidatePath('/super-admin/clients')
+  return { success: true }
+}
+
+export async function setClientUserLimit(orgId: string, limit: number | null) {
+  const auth = await requireSuperAdmin('manage_billing')
+  if (!auth.ok) return { error: auth.error }
+
+  if (limit !== null && (!Number.isInteger(limit) || limit <= 0)) {
+    return { error: 'User limit must be a positive whole number, or left blank to inherit the plan default' }
+  }
+
+  if (limit !== null) {
+    const { rows: activeRows } = await safeQuery(
+      `SELECT COUNT(*)::int AS active_count FROM public.users WHERE organization_id = $1 AND is_active = true`,
+      [orgId]
+    )
+    const activeCount = activeRows[0]?.active_count ?? 0
+    if (limit < activeCount) {
+      return { error: `Cannot set limit to ${limit} — this organization has ${activeCount} active users. Deactivate users first, or choose a higher limit.` }
+    }
+  }
+
+  const updateRes = await pool.query(
+    `UPDATE public.client_subscriptions SET user_limit = $1, updated_at = now() WHERE organization_id = $2`,
+    [limit, orgId]
+  )
+  if (updateRes.rowCount === 0) {
+    return { error: 'No subscription record found for this organization' }
+  }
+
+  await pool.query(
+    `INSERT INTO public.super_admin_audit_logs (event_code, entity_type, entity_name, details, severity) VALUES ($1, $2, $3, $4, $5)`,
+    [
+      'client.user_limit_changed',
+      'client',
+      orgId,
+      JSON.stringify({
+        message: limit === null ? 'User limit cleared — now inherits plan default' : `User limit set to ${limit}`,
+        organization_id: orgId,
+      }),
+      'low',
+    ]
+  )
+
+  revalidatePath(`/super-admin/clients/${orgId}`)
   revalidatePath('/super-admin/clients')
   return { success: true }
 }
