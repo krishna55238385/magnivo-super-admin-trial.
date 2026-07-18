@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useTransition } from 'react'
-import { Zap, DollarSign, TrendingUp, BarChart2, Download } from 'lucide-react'
+import { Zap, DollarSign, TrendingUp, BarChart2, Download, Search, AlertTriangle } from 'lucide-react'
 import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer } from 'recharts'
 import { getPlatformTokenUsage } from '@/app/actions/super-admin'
 
@@ -17,6 +17,18 @@ type UsageData = {
   daily: DailyRow[]
   totals: { total_tokens: number | string; total_cost: number | string }
 }
+
+type SerpApiUsage =
+  | {
+      ok: true
+      plan_name: string | null
+      plan_renewal_date: string | null
+      searches_per_month: number
+      this_month_usage: number
+      plan_searches_left: number
+      total_searches_left: number
+    }
+  | { ok: false; error: string }
 
 const MODEL_COLORS = ['#8b5cf6', '#6366f1', '#a78bfa', '#f59e0b', '#ec4899', '#22c55e', '#38bdf8']
 
@@ -43,7 +55,15 @@ function formatDate(d: string) {
   return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
 }
 
-export default function UsageClient({ initialData, initialDays }: { initialData: UsageData; initialDays: number }) {
+export default function UsageClient({
+  initialData,
+  initialDays,
+  serpUsage,
+}: {
+  initialData: UsageData
+  initialDays: number
+  serpUsage: SerpApiUsage
+}) {
   const [days, setDays] = useState(initialDays)
   const [data, setData] = useState<UsageData>(initialData)
   const [isPending, startTransition] = useTransition()
@@ -113,6 +133,49 @@ export default function UsageClient({ initialData, initialDays }: { initialData:
             <p className="text-[11px] text-white/25">{sub}</p>
           </div>
         ))}
+      </div>
+
+      {/* SerpApi usage */}
+      <div className="bg-[#111118] border border-white/[0.07] rounded-xl p-5">
+        <div className="flex items-center gap-2 mb-4">
+          <div className="w-9 h-9 rounded-lg bg-sky-500/10 flex items-center justify-center">
+            <Search className="w-4.5 h-4.5 text-sky-400" />
+          </div>
+          <div>
+            <p className="text-[13px] font-semibold text-white">SerpApi Usage</p>
+            <p className="text-[11px] text-white/30">
+              {serpUsage.ok ? `${serpUsage.plan_name ?? 'Unknown plan'} · resets ${serpUsage.plan_renewal_date ?? '—'}` : 'Live search API usage'}
+            </p>
+          </div>
+        </div>
+
+        {!serpUsage.ok ? (
+          <div className="flex items-center gap-2 py-4 text-[12px] text-amber-400/80">
+            <AlertTriangle className="w-4 h-4" />
+            <span>Unable to fetch SerpApi usage</span>
+          </div>
+        ) : (
+          (() => {
+            const used = serpUsage.this_month_usage
+            const total = serpUsage.searches_per_month
+            const pct = total > 0 ? Math.min(100, (used / total) * 100) : 0
+            const barColor = pct >= 90 ? 'bg-red-500' : pct >= 70 ? 'bg-amber-400' : 'bg-emerald-500'
+            const textColor = pct >= 90 ? 'text-red-400' : pct >= 70 ? 'text-amber-400' : 'text-white'
+            return (
+              <div className="space-y-2">
+                <div className="flex items-end justify-between">
+                  <p className={`text-[20px] font-bold ${textColor}`}>
+                    {used} <span className="text-[13px] font-normal text-white/40">/ {total} searches</span>
+                  </p>
+                  <p className="text-[11px] text-white/40">{serpUsage.total_searches_left} remaining</p>
+                </div>
+                <div className="h-1.5 rounded-full bg-white/[0.06] overflow-hidden">
+                  <div className={`h-full rounded-full transition-all ${barColor}`} style={{ width: `${pct}%` }} />
+                </div>
+              </div>
+            )
+          })()
+        )}
       </div>
 
       {/* Daily usage chart */}

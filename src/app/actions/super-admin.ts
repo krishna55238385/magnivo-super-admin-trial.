@@ -1042,6 +1042,40 @@ export async function logTokenUsage(data: {
   )
 }
 
+// SerpApi's live account endpoint has no fixed rate-limit budget of its own;
+// callers should avoid polling this on every render.
+export async function getSerpApiUsage() {
+  const auth = await requireSuperAdmin()
+  if (!auth.ok) {
+    return { ok: false as const, error: 'Authentication required' }
+  }
+
+  const apiKey = process.env.SERP_API_KEY
+  if (!apiKey) {
+    return { ok: false as const, error: 'SerpApi is not configured' }
+  }
+
+  try {
+    const res = await fetch(`https://serpapi.com/account?api_key=${apiKey}`, { cache: 'no-store' })
+    if (!res.ok) {
+      return { ok: false as const, error: `SerpApi request failed (${res.status})` }
+    }
+    const data = await res.json()
+    return {
+      ok: true as const,
+      plan_name: data.plan_name ?? null,
+      plan_renewal_date: data.plan_renewal_date ?? null,
+      searches_per_month: Number(data.searches_per_month) || 0,
+      this_month_usage: Number(data.this_month_usage) || 0,
+      plan_searches_left: Number(data.plan_searches_left) || 0,
+      total_searches_left: Number(data.total_searches_left) || 0,
+    }
+  } catch (err) {
+    console.error('getSerpApiUsage failed:', err)
+    return { ok: false as const, error: 'Unable to fetch SerpApi usage' }
+  }
+}
+
 // ──────────────────────────────────────────
 // SUPPORT
 // ──────────────────────────────────────────
